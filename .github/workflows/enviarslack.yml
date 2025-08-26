@@ -1,21 +1,23 @@
-name: drive-to-parquet-and-slack
+name: send-drive-to-slack
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # a cada 30 minutos
+    - cron: "*/30 * * * *"  # a cada 30 minutos
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   TZ: America/Sao_Paulo
 
 jobs:
-  run:
+  send:
     runs-on: ubuntu-latest
     concurrency:
-      group: drive-to-parquet-and-slack
+      group: send-drive-to-slack
+      cancel-in-progress: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,14 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ensure folders
-        run: |
-          mkdir -p inbox data out state
+      - name: Ensure state folder
+        run: mkdir -p state
 
-      - name: Compute run timestamp (America/Sao_Paulo)
-        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
-
-      # ===== GRAVAÇÃO SEGURA DO sa.json (NÃO EXPÕE O SECRET) =====
+      # === grava SA JSON com segurança (não vaza nos logs) ===
       - name: Write Service Account JSON (safe heredoc)
         run: |
           cat > sa.json <<'JSON'
@@ -54,67 +52,20 @@ jobs:
           print("Service Account JSON OK")
           PY
 
-      # ===== PULL DO DRIVE (PDFs da pasta, sem repetir) =====
-      - name: Pull PDFs do Drive (desde 26/08/2025 14:00:00 SP) sem repetir
-        env:
-          CUTOVER_SP: "2025-08-26T14:00:00"
-          TZ_NAME: "America/Sao_Paulo"
-        run: |
-          if [ -z "${{ secrets.DRIVE_FOLDER_ID }}" ]; then
-            echo "ERRO: Secret DRIVE_FOLDER_ID ausente."; exit 1
-          fi
-          python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
-
-      # ===== EXTRATOR (gera Parquet + XLS por rodada) =====
-      - name: Extrair e gerar Parquet+XLS por rodada (sem repetir)
-        env:
-          PDF_DIR: inbox
-          WRITE_SINGLE_RUN_PARQUET: "1"     # data/OFERTAS_YYYY-MM-DD_HH:MM:SS.parquet
-          WRITE_XLS_ARTIFACT: "1"           # out/OFERTAS_RUN_YYYY-MM-DD_HH-MM-SS.xlsx
-          TZ_NAME: "America/Sao_Paulo"
-          RUN_TS: ${{ env.RUN_TS }}
-        run: |
-          python scripts/PDF27.pyw --once
-
-      - name: Upload XLS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: OFERTAS_${{ env.RUN_TS }}.xlsx
-          path: out/OFERTAS_RUN_${{ env.RUN_TS }}.xlsx
-          if-no-files-found: error
-
-      # ===== COMMITA APENAS O QUE INTERESSA =====
-      - name: Commit & Push (somente data/ + state/)
-        run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add data/*.parquet state/*.json || true
-            git commit -m "chore: parquet/state @ ${GITHUB_RUN_NUMBER}"
-            git push
-          else
-            echo "No changes to commit."
-          fi
-
-      # ===== ENVIA PARA O SLACK: PDFs + pares PNG (VM/MB→PDF) =====
+      # === envia arquivos das pastas do Drive para o Slack ===
       - name: Send Drive PDFs + PNG pairs (VM+MB→PDF) to Slack
         env:
-          SLACK_TOKEN:   ${{ secrets.SLACK_TOKEN }}      # xoxb-...
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}    # ex.: C0123ABCD
-          PNG_FOLDER_ID: "1oFgYZpqLMGetirb8mpQTmgjeQ6zhZ7up"
-          PDF_FOLDER_ID: "1xjqqwIcPciT14fjdYfsZut-UvwtVD-pe"
-          CUTOVER_SP: "2025-08-26T14:00:00"              # opcional (SP)
+          SLACK_TOKEN:   ${{ secrets.SLACK_TOKEN }}      # mesmo token do seu ACERVO (xoxb-...)
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}    # mesmo Channel ID (C0XXXX...)
+          PNG_FOLDER_ID: "1oFgYZpqLMGetirb8mpQTmgjeQ6zhZ7up"  # pasta PNG
+          PDF_FOLDER_ID: "1xjqqwIcPciT14fjdYfsZut-UvwtVD-pe"  # pasta PDF
+          CUTOVER_SP: "2025-08-26T14:00:00"                   # opcional (SP). remova se quiser tudo
           TZ_NAME: "America/Sao_Paulo"
-          MAX_UPLOAD_MB: "100"
+          MAX_UPLOAD_MB: "100"                                # opcional (limite por arquivo)
         run: |
           python scripts/slack_send_drive_pairs.py
 
-      # ===== LIMPEZA =====
-      - name: Cleanup inbox (efêmero)
-        if: always()
-        run: rm -rf inbox || true
-
+      # === limpeza ===
       - name: Cleanup secrets file
         if: always()
         run: rm -f sa.json || true
