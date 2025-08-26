@@ -1,8 +1,8 @@
-name: send-drive-to-slack
+name: enviarslack
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # a cada 30 minutos
+    - cron: "*/30 * * * *"   # a cada 30 min
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ jobs:
   send:
     runs-on: ubuntu-latest
     concurrency:
-      group: send-drive-to-slack
+      group: enviarslack
       cancel-in-progress: false
 
     steps:
@@ -32,22 +32,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          # usa requirements.txt se existir; garante libs essenciais na sequência
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install slack_sdk Pillow google-api-python-client google-auth google-auth-httplib2
 
       - name: Ensure state folder
-        run: mkdir -p state
+        run: mkdir -p state scripts
 
-      # === cria o script no repositório de execução (evita "file not found") ===
-      - name: Create slack_send_drive_pairs.py (inline)
+      # cria o script inline (evita "file not found")
+      - name: Create slack_send_drive_pairs.py
         run: |
-          mkdir -p scripts
           cat > scripts/slack_send_drive_pairs.py <<'PY'
 # -*- coding: utf-8 -*-
 import os, sys, io, json, re
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
@@ -56,6 +52,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from PIL import Image
+from datetime import datetime, timezone
 
 SLACK_TOKEN   = os.environ.get("SLACK_TOKEN")
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL")
@@ -153,7 +150,7 @@ def main():
     cut_utc = to_utc_from_sp(CUTOVER_SP, TZ_NAME) if CUTOVER_SP else None
     state = load_state()
 
-    # PDFs: enviar direto (sem repetir)
+    # PDFs: enviar direto
     pdf_files = list_files(os.environ["PDF_FOLDER_ID"], cut_utc, mime_filter="application/pdf")
     pdf_sent = set(state.get("pdf_sent_ids", []))
     pdf_new = [f for f in pdf_files if f["id"] not in pdf_sent]
@@ -226,7 +223,7 @@ if __name__ == "__main__":
 PY
           chmod +x scripts/slack_send_drive_pairs.py
 
-      # === grava SA JSON com segurança (não vaza nos logs) ===
+      # grava o Service Account JSON com segurança
       - name: Write Service Account JSON (safe heredoc)
         run: |
           cat > sa.json <<'JSON'
@@ -235,26 +232,24 @@ PY
 
       - name: Validate sa.json
         run: |
-          python - << 'PY'
+          python - <<'PY'
           import json
           json.load(open('sa.json'))
           print("Service Account JSON OK")
           PY
 
-      # === envia arquivos das pastas do Drive para o Slack (sem extração) ===
       - name: Send Drive PDFs + PNG pairs (VM+MB→PDF) to Slack
         env:
           SLACK_TOKEN:   ${{ secrets.SLACK_TOKEN }}      # xoxb-...
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}    # ex.: C0123ABCD
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}    # C0123ABCD
           PNG_FOLDER_ID: "1oFgYZpqLMGetirb8mpQTmgjeQ6zhZ7up"  # pasta PNG
           PDF_FOLDER_ID: "1xjqqwIcPciT14fjdYfsZut-UvwtVD-pe"  # pasta PDF
-          CUTOVER_SP: "2025-08-26T14:00:00"                   # opcional (SP). remova se quiser tudo
+          CUTOVER_SP: "2025-08-26T14:00:00"                   # opcional
           TZ_NAME: "America/Sao_Paulo"
-          MAX_UPLOAD_MB: "100"                                # opcional
+          MAX_UPLOAD_MB: "100"
         run: |
           python scripts/slack_send_drive_pairs.py
 
-      # === limpeza ===
       - name: Cleanup secrets file
         if: always()
         run: rm -f sa.json || true
