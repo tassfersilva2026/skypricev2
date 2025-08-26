@@ -21,20 +21,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with:
+          python-version: "3.12"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Write Service Account JSON
-        run: |
-          echo "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
 
       - name: Ensure folders
         run: |
@@ -45,17 +43,30 @@ jobs:
 
       - name: Pull PDFs do Drive (desde 26/08/2025 14:00:00 SP) sem repetir
         env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           CUTOVER_SP: "2025-08-26T14:00:00"
           TZ_NAME: "America/Sao_Paulo"
         run: |
-          python scripts/drive_pull.py
+          # sanity check dos secrets (não imprime valores)
+          if [ -z "${{ secrets.DRIVE_FOLDER_ID }}" ]; then
+            echo "ERRO: Secret DRIVE_FOLDER_ID ausente (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
+            echo "ERRO: Secret GDRIVE_SERVICE_ACCOUNT_JSON ausente."
+            exit 1
+          fi
+
+          # escreve a chave do Service Account
+          echo "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
+
+          # chama passando o ID como argumento (garante que o script receba o valor)
+          python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
 
       - name: Extrair e gerar Parquet+XLS por rodada (sem repetir)
         env:
           PDF_DIR: inbox
-          WRITE_SINGLE_RUN_PARQUET: "1"
-          WRITE_XLS_ARTIFACT: "1"
+          WRITE_SINGLE_RUN_PARQUET: "1"     # gera data/OFERTAS_YYYY-MM-DD_HH:MM:SS.parquet
+          WRITE_XLS_ARTIFACT: "1"           # gera out/OFERTAS_RUN_YYYY-MM-DD_HH-MM-SS.xlsx
           TZ_NAME: "America/Sao_Paulo"
           RUN_TS: ${{ env.RUN_TS }}
         run: |
