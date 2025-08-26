@@ -6,9 +6,10 @@
 # - Parquet por rodada: data/OFERTAS_YYYY-MM-DD_HH:MM:SS.parquet (hora SP)
 # - XLS por rodada: out/OFERTAS_RUN_YYYY-MM-DD_HH-MM-SS.xlsx (artefato)
 # - Cache simples de PDFs (mtime+tamanho) para não reextrair repetidos
+# - Limite opcional de PDFs por rodada (--limit ou TEST_MAX_PDFS)
 
-import os, re, glob, json, time, argparse, logging, hashlib
-from datetime import datetime, date
+import os, re, glob, json, time, argparse, logging
+from datetime import datetime
 import pdfplumber
 import pandas as pd
 from tqdm import tqdm
@@ -27,6 +28,10 @@ ROW_IDS_FILE   = os.environ.get("ROW_IDS_FILE",   "state/OFERTASMATRIZ_ROW_IDS.t
 ERR_IDS_FILE   = os.environ.get("ERR_IDS_FILE",   "state/OFERTASMATRIZ_ERR_IDS.txt")
 STATE_JSON     = os.environ.get("STATE_JSON",     "state/OFERTASMATRIZ_STATE.json")
 TZ_NAME        = os.environ.get("TZ_NAME",        "America/Sao_Paulo")
+
+# Limite opcional para testar rodadas pequenas
+ENV_MAX_PDFS   = os.environ.get("TEST_MAX_PDFS")
+ENV_MAX_PDFS   = int(ENV_MAX_PDFS) if (ENV_MAX_PDFS or "").strip().isdigit() else None
 
 # Parquet por rodada e XLS artefato
 WRITE_SINGLE_RUN_PARQUET = os.environ.get("WRITE_SINGLE_RUN_PARQUET", "1").lower() in ("1","true","yes")
@@ -176,7 +181,6 @@ def extract_offers_from_pdf(pdf_path, search_dt):
     return offers, search_dt
 
 def get_trecho(file_name):
-    # tenta "BELGRU_..." ou "BELGRU-..."
     token = re.split(r"[_.-]", file_name)[0].upper()
     return token
 
@@ -195,8 +199,8 @@ def _run_names():
     - XLS:     OFERTAS_RUN_YYYY-MM-DD_HH-MM-SS.xlsx (compatível Windows)
     """
     if RUN_TS:
-        date_part, time_part = RUN_TS.split("_", 1)  # ex.: "2025-08-26", "14-00-00"
-        time_colon = time_part.replace("-", ":")     # "14:00:00"
+        date_part, time_part = RUN_TS.split("_", 1)
+        time_colon = time_part.replace("-", ":")
         parquet = f"data/OFERTAS_{date_part}_{time_colon}.parquet"
         xls     = f"out/OFERTAS_RUN_{RUN_TS}.xlsx"
     else:
@@ -225,11 +229,11 @@ def save_state(state: dict):
 def write_back_preserving(file_path, df_ofertas, df_erros):
     mode = "a" if os.path.exists(file_path) else "w"
     with pd.ExcelWriter(file_path, engine="openpyxl", mode=mode, if_sheet_exists=("replace" if mode=="a" else None)) as writer:
-        df_ofertas.to_excel(writer, index=False, sheet_name=SHEET_OFERTAS)
-        df_erros.to_excel(writer, index=False, sheet_name=SHEET_ERROS)
+        (df_ofertas if df_ofertas is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=SHEET_OFERTAS)
+        (df_erros   if df_erros   is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=SHEET_ERROS)
         try:
             ws = writer.sheets[SHEET_OFERTAS]
-            cols = list(df_ofertas.columns)
+            cols = list(df_ofertas.columns) if df_ofertas is not None else []
             for col_name in ["Data do Voo","Data/Hora da Busca"]:
                 if col_name in cols:
                     idx = cols.index(col_name) + 1
@@ -243,9 +247,9 @@ def export_xls_per_run(of_df: pd.DataFrame, er_df: pd.DataFrame | None):
     """Gera um XLS com abas OFERTAS e ERRO_MONITORAMENTO para artefato do run."""
     _, xls_path = _run_names()
     with pd.ExcelWriter(xls_path, engine="openpyxl", mode="w") as writer:
-        (of_df or pd.DataFrame()).to_excel(writer, index=False, sheet_name=SHEET_OFERTAS)
-        if er_df is not None and not er_df.empty:
-            er_df.to_excel(writer, index=False, sheet_name=SHEET_ERROS)
+        # CORREÇÃO: sem avaliar DataFrame como booleano
+        (of_df if of_df is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=SHEET_OFERTAS)
+        (er_df if er_df is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=SHEET_ERROS)
         try:
             ws = writer.sheets[SHEET_OFERTAS]
             cols = list(of_df.columns) if of_df is not None else []
@@ -285,7 +289,7 @@ def export_parquet(ofertas_df, erros_df):
         export_xls_per_run(of, erros_df)
 
 # ── 1 ciclo de atualização ────────────────────────────────────────────────────
-def run_cycle():
+def run_cycle(max_files: int | None = None):
     pdfs = sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf")))
     if not pdfs:
         print("Nenhum PDF na pasta. Saindo.")
@@ -305,9 +309,16 @@ def run_cycle():
         if sig is None: continue
         if state.get(p) != sig:
             to_process.append(p)
+
     if not to_process:
         print("Nada novo a processar (cache mtime+tamanho).")
         return pd.DataFrame(), pd.DataFrame(), 0, 0
+
+    # aplica limite (teste)
+    eff_limit = max_files if max_files is not None else ENV_MAX_PDFS
+    if eff_limit is not None and eff_limit > 0:
+        to_process = to_process[:eff_limit]
+        print(f"[teste] Limitando processamento a {eff_limit} PDF(s).")
 
     offers_rows, errors_rows = [], []
     for path in tqdm(to_process, desc="Processando PDFs"):
@@ -403,15 +414,18 @@ def run_cycle():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="Executa apenas 1 ciclo.")
+    ap.add_argument("--limit", type=int, default=None, help="Limite de PDFs a processar na rodada.")
     args = ap.parse_args()
 
+    max_files = args.limit if args.limit is not None else ENV_MAX_PDFS
+
     if args.once:
-        of_df, er_df, n_of, n_er = run_cycle()
+        of_df, er_df, n_of, n_er = run_cycle(max_files=max_files)
         print(f"✅ Ciclo concluído. Ofertas novas: {n_of} | Erros novos: {n_er}")
     else:
         while True:
             try:
-                of_df, er_df, n_of, n_er = run_cycle()
+                of_df, er_df, n_of, n_er = run_cycle(max_files=max_files)
                 print(f"✅ Ciclo concluído. Ofertas novas: {n_of} | Erros novos: {n_er}")
             except Exception as e:
                 print(f"❌ Erro no ciclo: {e}")
