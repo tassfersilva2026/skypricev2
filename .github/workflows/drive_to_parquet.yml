@@ -1,7 +1,7 @@
 name: Drive to Parquet (TESTE 3 PDFs)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -25,25 +25,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* google-api-python-client==2.* google-auth==2.* google-auth-httplib2==0.*
 
-      - name: Compute run timestamp (America/Sao_Paulo)
-        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
+      - name: Compute RUN_TS (America/Sao_Paulo)
+        run: |
+          echo "RUN_TS=$(TZ=America/Sao_Paulo date +\"%Y-%m-%d_%H-%M-%S\")" >> "$GITHUB_ENV"
 
-      - name: Write sa.json (from secret)
+      - name: Write Service Account JSON (from secret)
         run: |
           if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
             echo "ERRO: configure o secret GDRIVE_SERVICE_ACCOUNT_JSON"; exit 1
           fi
-          printf "%s" "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
+          # grava o JSON exatamente como veio (com quebras de linha)
+          cat > sa.json <<'JSON'
+          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          JSON
+
+      - name: Validate sa.json
+        run: |
+          python - <<'PY'
+          import json
+          json.load(open('sa.json'))
+          print("Service Account JSON OK")
+          PY
 
       - name: Pull PDFs do Drive (TESTE: 3 arquivos)
         env:
-          MAX_FILES: "3"
+          MAX_FILES: "3"   # limita o scripts/drive_pull.py a 3 itens
         run: |
           if [ -z "${{ secrets.DRIVE_FOLDER_ID }}" ]; then
             echo "ERRO: configure o secret DRIVE_FOLDER_ID"; exit 1
           fi
           python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
-          echo "---- inbox ----"; ls -lah inbox || true
+          echo "---- inbox ----"
+          ls -lah inbox || true
 
       - name: Extrair e gerar Parquet+XLS (TESTE 3)
         env:
@@ -60,7 +73,7 @@ jobs:
       - name: Upload XLS (artefato)
         uses: actions/upload-artifact@v4
         with:
-          name: OFERTAS_XLS_${{ env.RUN_TS }}
+          name: "OFERTAS_XLS_${{ env.RUN_TS }}"
           path: out/*.xlsx
           if-no-files-found: warn
           retention-days: 7
@@ -68,7 +81,7 @@ jobs:
       - name: Upload Parquets
         uses: actions/upload-artifact@v4
         with:
-          name: OFERTAS_PARQUETS_${{ env.RUN_TS }}
+          name: "OFERTAS_PARQUETS_${{ env.RUN_TS }}"
           path: |
             data/*.parquet
             out/*.parquet
