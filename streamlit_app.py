@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, date, time as dtime
 from typing import Callable, List, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,30 +11,34 @@ import altair as alt
 
 st.set_page_config(page_title="Skyscanner — Painel", layout="wide", initial_sidebar_state="expanded")
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_PATH = APP_DIR / "data"
+APP_DIR   = Path(__file__).resolve().parent
+DATA_DIR  = APP_DIR / "data"
+
+# Cortes de origem de dados
+LEGACY_FILE = DATA_DIR / "OFERTASLEGADO.parquet"
+CUTOFF_TS   = pd.Timestamp("2025-08-26 14:00:00")  # 26/08/2025 14:00
 
 # ============================== UTILIDADES GERAIS ==============================
 
 def std_agencia(raw: str) -> str:
     ag = (raw or "").strip().upper()
-    if ag == "BOOKINGCOM": return "BOOKING.COM"
-    if ag == "KIWICOM": return "KIWI.COM"
-    if ag.startswith("123MILHAS") or ag == "123": return "123MILHAS"
-    if ag.startswith("MAXMILHAS") or ag == "MAX": return "MAXMILHAS"
-    if ag.startswith("CAPOVIAGENS"): return "CAPOVIAGENS"
-    if ag.startswith("FLIPMILHAS"): return "FLIPMILHAS"
-    if ag.startswith("VAIDEPROMO"): return "VAIDEPROMO"
-    if ag.startswith("KISSANDFLY"): return "KISSANDFLY"
-    if ag.startswith("ZUPPER"): return "ZUPPER"
-    if ag.startswith("MYTRIP"): return "MYTRIP"
-    if ag.startswith("GOTOGATE"): return "GOTOGATE"
-    if ag.startswith("DECOLAR"): return "DECOLAR"
-    if ag.startswith("EXPEDIA"): return "EXPEDIA"
-    if ag.startswith("GOL"): return "GOL"
-    if ag.startswith("LATAM"): return "LATAM"
-    if ag.startswith("TRIPCOM"): return "TRIP.COM"
-    if ag.startswith("VIAJANET"): return "VIAJANET"
+    if ag == "BOOKINGCOM":            return "BOOKING.COM"
+    if ag == "KIWICOM":               return "KIWI.COM"
+    if ag.startswith("123MILHAS") or ag == "123":   return "123MILHAS"
+    if ag.startswith("MAXMILHAS") or ag == "MAX":   return "MAXMILHAS"
+    if ag.startswith("CAPOVIAGENS"):  return "CAPOVIAGENS"
+    if ag.startswith("FLIPMILHAS"):   return "FLIPMILHAS"
+    if ag.startswith("VAIDEPROMO"):   return "VAIDEPROMO"
+    if ag.startswith("KISSANDFLY"):   return "KISSANDFLY"
+    if ag.startswith("ZUPPER"):       return "ZUPPER"
+    if ag.startswith("MYTRIP"):       return "MYTRIP"
+    if ag.startswith("GOTOGATE"):     return "GOTOGATE"
+    if ag.startswith("DECOLAR"):      return "DECOLAR"
+    if ag.startswith("EXPEDIA"):      return "EXPEDIA"
+    if ag.startswith("GOL"):          return "GOL"
+    if ag.startswith("LATAM"):        return "LATAM"
+    if ag.startswith("TRIPCOM"):      return "TRIP.COM"
+    if ag.startswith("VIAJANET"):     return "VIAJANET"
     if ag in ("", "NAN", "NONE", "NULL", "SKYSCANNER"): return "SEM OFERTAS"
     return ag
 
@@ -42,17 +47,13 @@ def std_cia(raw: str) -> str:
     s = (str(raw) or "").strip().upper()
     s_simple = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
     # AZUL
-    if s in {"AD", "AZU"} or s.startswith("AZUL") or "AZUL" in s_simple:
-        return "AZUL"
+    if s in {"AD", "AZU"} or s.startswith("AZUL") or "AZUL" in s_simple: return "AZUL"
     # GOL
-    if s in {"G3"} or s.startswith("GOL") or "GOL" in s_simple:
-        return "GOL"
+    if s in {"G3"} or s.startswith("GOL") or "GOL" in s_simple: return "GOL"
     # LATAM (TAM/JJ/LA)
-    if s in {"LA", "JJ"} or s.startswith("TAM") or s.startswith("LATAM") or "LATAM" in s_simple or "TAM" in s_simple:
-        return "LATAM"
-    if s in {"AZUL", "GOL", "LATAM"}:
-        return s
-    return s # mantém como veio; telas usam CIA_NORM
+    if s in {"LA", "JJ"} or s.startswith("TAM") or s.startswith("LATAM") or "LATAM" in s_simple or "TAM" in s_simple: return "LATAM"
+    if s in {"AZUL", "GOL", "LATAM"}: return s
+    return s  # mantém como veio; telas usam CIA_NORM
 
 def advp_nearest(x) -> int:
     try:
@@ -63,76 +64,101 @@ def advp_nearest(x) -> int:
         v = 1
     return min([1, 5, 11, 17, 30], key=lambda k: abs(v - k))
 
-@st.cache_data(show_spinner=True)
-def load_base(data_folder: Path) -> pd.DataFrame:
-    dfs = []
-    
-    # Define a data de corte para o arquivo legado
-    cut_off_datetime = datetime(2025, 8, 26, 14, 0, 0)
-    
-    # 1. Carrega o arquivo legado se existir
-    legado_path = data_folder / "OFERTASLEGADO.parquet"
-    if legado_path.exists():
-        st.info(f"Carregando dados do arquivo legado: {legado_path.as_posix()}")
-        df_legado = pd.read_parquet(legado_path)
-        # Filtra os dados do legado para garantir que não se sobreponham
-        df_legado["DATAHORA_BUSCA"] = pd.to_datetime(df_legado["DATAHORA_BUSCA"], errors="coerce", dayfirst=True)
-        df_legado = df_legado[df_legado["DATAHORA_BUSCA"] <= cut_off_datetime].copy()
-        dfs.append(df_legado)
-    
-    # 2. Carrega os arquivos dinâmicos (criados a partir da data de corte)
-    dynamic_files = list(data_folder.glob("OFERTAS_*.parquet"))
-    if dynamic_files:
-        st.info(f"Carregando {len(dynamic_files)} arquivos dinâmicos...")
-        for file_path in dynamic_files:
-            df_dynamic = pd.read_parquet(file_path)
-            df_dynamic["DATAHORA_BUSCA"] = pd.to_datetime(df_dynamic["DATAHORA_BUSCA"], errors="coerce", dayfirst=True)
-            # Filtra os dados dinâmicos para a partir da data de corte
-            df_dynamic = df_dynamic[df_dynamic["DATAHORA_BUSCA"] > cut_off_datetime].copy()
-            dfs.append(df_dynamic)
-            
-    if not dfs:
-        st.error(f"Nenhum arquivo de dados encontrado na pasta: {data_folder.as_posix()}")
-        st.stop()
-        
-    df = pd.concat(dfs, ignore_index=True)
-    
-    # Normalização das colunas
+def _rename_minimal(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante os nomes-base esperados para permitir filtros e merges."""
     colmap = {
-        0: "IDPESQUISA", 1: "CIA", 2: "HORA_BUSCA", 3: "HORA_PARTIDA", 4: "HORA_CHEGADA", 
-        5: "TIPO_VOO", 6: "DATA_EMBARQUE", 7: "DATAHORA_BUSCA", 8: "AGENCIA_COMP", 
-        9: "PRECO", 10: "TRECHO", 11: "ADVP", 12: "RANKING"
+        0: "IDPESQUISA",
+        1: "CIA",
+        2: "HORA_BUSCA",
+        3: "HORA_PARTIDA",
+        4: "HORA_CHEGADA",
+        5: "TIPO_VOO",
+        6: "DATA_EMBARQUE",
+        7: "DATAHORA_BUSCA",
+        8: "AGENCIA_COMP",
+        9: "PRECO",
+        10: "TRECHO",
+        11: "ADVP",
+        12: "RANKING"
     }
-    
-    # Mapeamento do nome das colunas
-    rename = {
-        df.columns[i]: colmap[i] for i in range(min(13, df.shape[1])) 
-        if df.columns[i] in df.columns and df.columns[i] != colmap[i]
-    }
-    if rename:
+    # renomeia pelo índice se necessário (backward compat)
+    if list(df.columns[:13]) != list(colmap.values()):
+        rename = {df.columns[i]: colmap[i] for i in range(min(13, df.shape[1]))}
         df = df.rename(columns=rename)
-        
+    return df
+
+def _normalize_final(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica todas as normalizações do app original."""
     for c in ["HORA_BUSCA", "HORA_PARTIDA", "HORA_CHEGADA"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c].astype(str).str.strip(), errors="coerce").dt.strftime("%H:%M:%S")
-            
     df["HORA_HH"] = pd.to_datetime(df["HORA_BUSCA"], errors="coerce").dt.hour
-
+    for c in ["DATA_EMBARQUE", "DATAHORA_BUSCA"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
     if "PRECO" in df.columns:
         df["PRECO"] = (
             df["PRECO"].astype(str)
-            .str.replace(r"[^\d,.-]", "", regex=True)
-            .str.replace(",", ".", regex=False)
+              .str.replace(r"[^\d,.-]", "", regex=True)
+              .str.replace(",", ".", regex=False)
         )
         df["PRECO"] = pd.to_numeric(df["PRECO"], errors="coerce")
-
     if "RANKING" in df.columns:
         df["RANKING"] = pd.to_numeric(df["RANKING"], errors="coerce").astype("Int64")
-
     df["AGENCIA_NORM"] = df["AGENCIA_COMP"].apply(std_agencia)
-    df["ADVP_CANON"] = df["ADVP"].apply(advp_nearest)
-    df["CIA_NORM"] = df.get("CIA", pd.Series([None]*len(df))).apply(std_cia)
+    df["ADVP_CANON"]   = df["ADVP"].apply(advp_nearest)
+    # NOVO: normalização de Cia
+    df["CIA_NORM"]     = df.get("CIA", pd.Series([None]*len(df))).apply(std_cia)
+    return df
 
+def _discover_files() -> tuple[list[Path], list[Path]]:
+    """Retorna (legacy_files, new_files) conforme regra."""
+    legacy = [LEGACY_FILE] if LEGACY_FILE.exists() else []
+    new_files = sorted(DATA_DIR.glob("OFERTAS_*.parquet"))
+    return (legacy, new_files)
+
+def _files_cache_key(paths: list[Path]) -> tuple[str, ...]:
+    """Gera uma chave de cache dependente de nomes e mtimes."""
+    return tuple(f"{p.name}:{(p.stat().st_mtime_ns if p.exists() else 0)}" for p in sorted(paths, key=lambda x: x.name))
+
+@st.cache_data(show_spinner=True)
+def load_base(data_dir: Path, legacy_key: tuple[str, ...], new_key: tuple[str, ...]) -> pd.DataFrame:
+    """Carrega dados combinando legado (< cutoff) e novos (>= cutoff)."""
+    # Lê legado (apenas < CUTOFF_TS)
+    frames: list[pd.DataFrame] = []
+    if LEGACY_FILE.exists():
+        df_leg = pd.read_parquet(LEGACY_FILE)
+        df_leg = _rename_minimal(df_leg)
+        # precisamos do DATAHORA_BUSCA parseado para filtrar
+        df_leg["DATAHORA_BUSCA"] = pd.to_datetime(df_leg["DATAHORA_BUSCA"], errors="coerce", dayfirst=True)
+        df_leg = df_leg[df_leg["DATAHORA_BUSCA"] < CUTOFF_TS]
+        frames.append(df_leg)
+
+    # Lê novos arquivos (apenas >= CUTOFF_TS)
+    new_files = sorted(data_dir.glob("OFERTAS_*.parquet"))
+    for p in new_files:
+        try:
+            dfn = pd.read_parquet(p)
+            dfn = _rename_minimal(dfn)
+            dfn["DATAHORA_BUSCA"] = pd.to_datetime(dfn["DATAHORA_BUSCA"], errors="coerce", dayfirst=True)
+            dfn = dfn[dfn["DATAHORA_BUSCA"] >= CUTOFF_TS]
+            if not dfn.empty:
+                frames.append(dfn)
+        except Exception as e:
+            st.warning(f"Falha ao ler {p.name}: {e}")
+
+    if not frames:
+        # fallback: avisa e interrompe
+        missing = " e ".join([
+            "OFERTASLEGADO.parquet ausente" if not LEGACY_FILE.exists() else "",
+            "nenhum OFERTAS_*.parquet encontrado" if len(new_files) == 0 else ""
+        ]).strip(" e ")
+        st.error("Nenhum dado carregado. " + (missing or ""))
+        st.stop()
+
+    df = pd.concat(frames, ignore_index=True)
+    # Normalização final (igual ao original)
+    df = _normalize_final(df)
     return df
 
 def winners_by_position(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,27 +197,27 @@ def last_update_from_cols(df: pd.DataFrame) -> str:
 # ---- Estilos dos cards (Painel)
 CARD_CSS = """
 <style>
-.cards-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-@media (max-width: 1100px) { .cards-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
-@media (max-width: 700px) { .cards-grid { grid-template-columns: 1fr; } }
-.card { border:1px solid #e9e9ee; border-radius:14px; padding:10px 12px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04); }
-.card .title { font-weight:650; font-size:15px; margin-bottom:8px; }
-.goldcard{background:#FFF9E5;border-color:#D4AF37;}
-.silvercard{background:#F7F7FA;border-color:#C0C0C0;}
-.bronzecard{background:#FFF1E8;border-color:#CD7F32;}
-.row{display:flex;gap:8px;}
-.item{flex:1;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:10px;border:1px solid #e3e3e8;background:#fafbfc;}
-.pos{font-weight:700;font-size:12px;opacity:.85;}
-.pct{font-size:16px;font-weight:650;}
+ .cards-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+ @media (max-width: 1100px) { .cards-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+ @media (max-width: 700px)  { .cards-grid { grid-template-columns: 1fr; } }
+ .card { border:1px solid #e9e9ee; border-radius:14px; padding:10px 12px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+ .card .title { font-weight:650; font-size:15px; margin-bottom:8px; }
+ .goldcard{background:#FFF9E5;border-color:#D4AF37;}
+ .silvercard{background:#F7F7FA;border-color:#C0C0C0;}
+ .bronzecard{background:#FFF1E8;border-color:#CD7F32;}
+ .row{display:flex;gap:8px;}
+ .item{flex:1;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:10px;border:1px solid #e3e3e8;background:#fafbfc;}
+ .pos{font-weight:700;font-size:12px;opacity:.85;}
+ .pct{font-size:16px;font-weight:650;}
 </style>
 """
 
 # ---- Estilo para cards empilhados por Cia
 CARDS_STACK_CSS = """
 <style>
-.cards-stack { display:flex; flex-direction:column; gap:10px; }
-.cards-stack .card { width:100%; }
-.stack-title { font-weight:800; padding:8px 10px; margin:6px 0 10px 0; border-radius:10px; border:1px solid #e9e9ee; background:#f8fafc; color:#0A2A6B; }
+ .cards-stack { display:flex; flex-direction:column; gap:10px; }
+ .cards-stack .card { width:100%; }
+ .stack-title { font-weight:800; padding:8px 10px; margin:6px 0 10px 0; border-radius:10px; border:1px solid #e9e9ee; background:#f8fafc; color:#0A2A6B; }
 </style>
 """
 
@@ -248,8 +274,7 @@ def make_line(df: pd.DataFrame, x_col: str, y_col: str, color: str | None = None
 
 # ---- Estado dos filtros ----
 def _init_filter_state(df_raw: pd.DataFrame):
-    if "flt" in st.session_state:
-        return
+    if "flt" in st.session_state: return
     dmin = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").min()
     dmax = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").max()
     st.session_state["flt"] = {
@@ -265,70 +290,45 @@ def render_filters(df_raw: pd.DataFrame, key_prefix: str = "flt"):
     _init_filter_state(df_raw)
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.1, 1, 2, 1, 1.4])
+
     dmin_abs = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").min()
     dmax_abs = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").max()
     dmin_abs = dmin_abs.date() if pd.notna(dmin_abs) else date(2000, 1, 1)
     dmax_abs = dmax_abs.date() if pd.notna(dmax_abs) else date.today()
+
     with c1:
         dt_ini = st.date_input(
-            "Data inicial",
-            key=f"{key_prefix}_dtini",
+            "Data inicial", key=f"{key_prefix}_dtini",
             value=st.session_state["flt"]["dt_ini"],
-            min_value=dmin_abs,
-            max_value=dmax_abs,
-            format="DD/MM/YYYY"
+            min_value=dmin_abs, max_value=dmax_abs, format="DD/MM/YYYY"
         )
     with c2:
         dt_fim = st.date_input(
-            "Data final",
-            key=f"{key_prefix}_dtfim",
+            "Data final", key=f"{key_prefix}_dtfim",
             value=st.session_state["flt"]["dt_fim"],
-            min_value=dmin_abs,
-            max_value=dmax_abs,
-            format="DD/MM/YYYY"
+            min_value=dmin_abs, max_value=dmax_abs, format="DD/MM/YYYY"
         )
     with c3:
         advp_all = sorted(set(pd.to_numeric(df_raw["ADVP_CANON"], errors="coerce").dropna().astype(int).tolist()))
-        advp_sel = st.multiselect(
-            "ADVP",
-            options=advp_all,
-            default=st.session_state["flt"]["advp"],
-            key=f"{key_prefix}_advp"
-        )
+        advp_sel = st.multiselect("ADVP", options=advp_all, default=st.session_state["flt"]["advp"], key=f"{key_prefix}_advp")
     with c4:
         trechos_all = sorted([t for t in df_raw["TRECHO"].dropna().unique().tolist() if str(t).strip() != ""])
-        tr_sel = st.multiselect(
-            "Trechos",
-            options=trechos_all,
-            default=st.session_state["flt"]["trechos"],
-            key=f"{key_prefix}_trechos"
-        )
+        tr_sel = st.multiselect("Trechos", options=trechos_all, default=st.session_state["flt"]["trechos"], key=f"{key_prefix}_trechos")
     with c5:
-        hh_sel = st.multiselect(
-            "Hora da busca",
-            options=list(range(24)),
-            default=st.session_state["flt"]["hh"],
-            key=f"{key_prefix}_hh"
-        )
+        hh_sel = st.multiselect("Hora da busca", options=list(range(24)), default=st.session_state["flt"]["hh"], key=f"{key_prefix}_hh")
     with c6:
         cia_presentes = set(str(x).upper() for x in df_raw.get("CIA_NORM", pd.Series([], dtype=str)).dropna().unique())
         ordem = ["AZUL", "GOL", "LATAM"]
         cia_opts = [c for c in ordem if (not cia_presentes or c in cia_presentes)] or ordem
         cia_default = [c for c in st.session_state["flt"]["cia"] if c in cia_opts]
-        cia_sel = st.multiselect(
-            "Cia (Azul/Gol/Latam)",
-            options=cia_opts,
-            default=cia_default,
-            key=f"{key_prefix}_cia"
-        )
+        cia_sel = st.multiselect("Cia (Azul/Gol/Latam)", options=cia_opts, default=cia_default, key=f"{key_prefix}_cia")
+
     st.session_state["flt"] = {
-        "dt_ini": dt_ini,
-        "dt_fim": dt_fim,
-        "advp": advp_sel or [],
-        "trechos": tr_sel or [],
-        "hh": hh_sel or [],
-        "cia": cia_sel or []
+        "dt_ini": dt_ini, "dt_fim": dt_fim,
+        "advp": advp_sel or [], "trechos": tr_sel or [],
+        "hh": hh_sel or [], "cia": cia_sel or []
     }
+
     mask = pd.Series(True, index=df_raw.index)
     mask &= (pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce") >= pd.Timestamp(dt_ini))
     mask &= (pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce") <= pd.Timestamp(dt_fim))
@@ -340,6 +340,7 @@ def render_filters(df_raw: pd.DataFrame, key_prefix: str = "flt"):
         mask &= df_raw["HORA_HH"].isin(hh_sel)
     if st.session_state["flt"]["cia"]:
         mask &= df_raw["CIA_NORM"].astype(str).str.upper().isin(st.session_state["flt"]["cia"])
+
     df = df_raw[mask].copy()
     st.caption(f"Linhas após filtros: {fmt_int(len(df))} • Última atualização: {last_update_from_cols(df)}")
     st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
@@ -359,6 +360,7 @@ def register_tab(label: str):
 @register_tab("Painel")
 def tab1_painel(df_raw: pd.DataFrame):
     df = render_filters(df_raw, key_prefix="t1")
+
     st.subheader("Painel")
     total_pesq = df["IDPESQUISA"].nunique() or 1
     cov = {r: df.loc[df["RANKING"].eq(r), "IDPESQUISA"].nunique() for r in (1, 2, 3)}
@@ -370,51 +372,61 @@ def tab1_painel(df_raw: pd.DataFrame):
         f"3º: {cov[3]/total_pesq*100:.1f}%</div>",
         unsafe_allow_html=True
     )
+
     st.markdown(CARD_CSS, unsafe_allow_html=True)
     st.markdown("<hr style='margin:6px 0'>", unsafe_allow_html=True)
-    # Painel geral (cards lado a lado) — igual ao seu original
+
+    # Painel geral (cards lado a lado)
     W = winners_by_position(df)
     Wg = W.replace({
         "R1": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
         "R2": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
         "R3": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
     })
+
     agencias_all = sorted(set(df["AGENCIA_NORM"].dropna().astype(str)))
     targets_base = list(agencias_all)
-    if "GRUPO 123" not in targets_base:
-        targets_base.insert(0, "GRUPO 123")
-    if "SEM OFERTAS" not in targets_base:
-        targets_base.append("SEM OFERTAS")
+    if "GRUPO 123" not in targets_base: targets_base.insert(0, "GRUPO 123")
+    if "SEM OFERTAS" not in targets_base: targets_base.append("SEM OFERTAS")
+
     def pcts_for_target(base_df: pd.DataFrame, tgt: str, agrupado: bool) -> tuple[float,float,float]:
-        base = (base_df.replace({
-            "R1": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
-            "R2": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
-            "R3": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
-        }) if agrupado else base_df)
+        base = (
+            base_df.replace({
+                "R1": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
+                "R2": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
+                "R3": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
+            }) if agrupado else base_df
+        )
         p1 = float((base["R1"] == tgt).mean())*100
         p2 = float((base["R2"] == tgt).mean())*100
         p3 = float((base["R3"] == tgt).mean())*100
         return p1, p2, p3
+
     targets_sorted = sorted(
         targets_base,
         key=lambda t: pcts_for_target(Wg if t=="GRUPO 123" else W, t, t=="GRUPO 123")[0],
         reverse=True
     )
+
     cards = []
     for idx, tgt in enumerate(targets_sorted):
         p1, p2, p3 = pcts_for_target(Wg if tgt=="GRUPO 123" else W, tgt, tgt=="GRUPO 123")
         rank_cls = "goldcard" if idx == 0 else "silvercard" if idx == 1 else "bronzecard" if idx == 2 else ""
         cards.append(card_html(tgt, p1, p2, p3, rank_cls))
     st.markdown(f"<div class='cards-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
-    # ===== NOVO: Painel por Cia (colunas com cards empilhados)
+
+    # ===== Painel por Cia (colunas com cards empilhados)
     st.markdown("<hr style='margin:14px 0 8px 0'>", unsafe_allow_html=True)
     st.subheader("Painel por Cia")
     st.caption("Cada coluna mostra o ranking das agências para a CIA correspondente (cards um abaixo do outro).")
     st.markdown(CARDS_STACK_CSS, unsafe_allow_html=True)
+
     if "CIA_NORM" not in df.columns:
         st.info("Coluna 'CIA_NORM' não encontrada nos dados filtrados.")
         return
+
     c1, c2, c3 = st.columns(3)
+
     def render_por_cia(container, df_in: pd.DataFrame, cia_name: str):
         with container:
             st.markdown(f"<div class='stack-title'>Ranking {cia_name.title()}</div>", unsafe_allow_html=True)
@@ -429,20 +441,23 @@ def tab1_painel(df_raw: pd.DataFrame):
             })
             ags = sorted(set(sub["AGENCIA_NORM"].dropna().astype(str)))
             targets = [a for a in ags if a != "SEM OFERTAS"]
-            if "GRUPO 123" not in targets:
-                targets.insert(0, "GRUPO 123")
+            if "GRUPO 123" not in targets: targets.insert(0, "GRUPO 123")
+
             def pct_target(tgt: str):
                 base = Wc_g if tgt == "GRUPO 123" else Wc
                 p1 = float((base["R1"] == tgt).mean())*100
                 p2 = float((base["R2"] == tgt).mean())*100
                 p3 = float((base["R3"] == tgt).mean())*100
                 return p1, p2, p3
+
             targets_sorted_local = sorted(targets, key=lambda t: pct_target(t)[0], reverse=True)
             cards_local = [card_html(t, *pct_target(t)) for t in targets_sorted_local]
             st.markdown(f"<div class='cards-stack'>{''.join(cards_local)}</div>", unsafe_allow_html=True)
+
     render_por_cia(c1, df, "AZUL")
     render_por_cia(c2, df, "GOL")
     render_por_cia(c3, df, "LATAM")
+
 # ───────────────────────────── ABA: Painel (END) ─────────────────────────────
 
 # ──────────────────────── ABA: Top 3 Agências (START) ────────────────────────
@@ -453,110 +468,102 @@ def tab2_top3_agencias(df_raw: pd.DataFrame):
     if df.empty:
         st.info("Sem dados para os filtros.")
         return
+
     import numpy as _np
     import pandas as _pd
-    # ======= Paleta fixa por coluna =======
-    BLUE = "#cfe3ff" # Preços Top 1/2/3
+
+    # Paleta fixa por coluna
+    BLUE = "#cfe3ff"   # Preços Top 1/2/3
     ORANGE = "#fdd0a2" # 123milhas
-    GREEN = "#c7e9c0" # Maxmilhas
+    GREEN = "#c7e9c0"  # Maxmilhas
     YELLOW = "#fee391" # FlipMilhas
-    PINK = "#f1b6da" # Capo Viagens/Capoviagens
+    PINK = "#f1b6da"   # Capo Viagens/Capoviagens
+
     def _hex_to_rgb(h): return tuple(int(h[i:i+2], 16) for i in (1, 3, 5))
     def _rgb_to_hex(t): return f"#{t[0]:02x}{t[1]:02x}{t[2]:02x}"
-    def _blend(c_from, c_to, t):
-        f, to = _hex_to_rgb(c_from), _hex_to_rgb(c_to)
-        return _rgb_to_hex(tuple(int(round(f[i] + (to[i]-f[i])*t)) for i in range(3)))
-    def make_scale(base_hex, steps=5):
-        return [_blend("#ffffff", base_hex, k/(steps-1)) for k in range(steps)]
-    SCALE_BLUE = make_scale(BLUE)
+    def _blend(c_from, c_to, t): f, to = _hex_to_rgb(c_from), _hex_to_rgb(c_to); return _rgb_to_hex(tuple(int(round(f[i] + (to[i]-f[i])*t)) for i in range(3)))
+    def make_scale(base_hex, steps=5): return [_blend("#ffffff", base_hex, k/(steps-1)) for k in range(steps)]
+    SCALE_BLUE   = make_scale(BLUE)
     SCALE_ORANGE = make_scale(ORANGE)
-    SCALE_GREEN = make_scale(GREEN)
+    SCALE_GREEN  = make_scale(GREEN)
     SCALE_YELLOW = make_scale(YELLOW)
-    SCALE_PINK = make_scale(PINK)
+    SCALE_PINK   = make_scale(PINK)
+
     def style_heatmap_discrete(styler: _pd.io.formats.style.Styler, col: str, scale_colors: list[str]):
         s = _pd.to_numeric(styler.data[col], errors="coerce")
-        if s.notna().sum() == 0:
-            return styler
+        if s.notna().sum() == 0: return styler
         try:
             bins = _pd.qcut(s.rank(method="average"), q=5, labels=False, duplicates="drop")
         except Exception:
             bins = _pd.cut(s.rank(method="average"), bins=5, labels=False)
         bins = bins.fillna(-1).astype(int)
         def _fmt(val, idx):
-            if _pd.isna(val) or bins.iloc[idx] == -1:
-                return "background-color: #ffffff; color:#111111"
+            if _pd.isna(val) or bins.iloc[idx] == -1: return "background-color: #ffffff; color:#111111"
             color = scale_colors[int(bins.iloc[idx])]
             return f"background-color: {color}; color:#111111"
         styler = styler.apply(lambda col_vals: [_fmt(v, i) for i, v in enumerate(col_vals)], subset=[col])
         return styler
+
     A_MAX, A_123, A_FLIP, A_CAPO = "MAXMILHAS", "123MILHAS", "FLIPMILHAS", "CAPOVIAGENS"
-    by_ag = (
-        df.groupby(["TRECHO", "AGENCIA_NORM"], as_index=False)
-        .agg(PRECO_MIN=("PRECO", "min"))
-    )
+    by_ag = (df.groupby(["TRECHO", "AGENCIA_NORM"], as_index=False).agg(PRECO_MIN=("PRECO", "min")))
+
     def _row_top3(g: _pd.DataFrame) -> _pd.Series:
         g = g.sort_values("PRECO_MIN", ascending=True).reset_index(drop=True)
-        def name(i): return g.loc[i, "AGENCIA_NORM"] if i < len(g) else "-"
+        def name(i):  return g.loc[i, "AGENCIA_NORM"] if i < len(g) else "-"
         def price(i): return g.loc[i, "PRECO_MIN"] if i < len(g) else _np.nan
         def price_of(ag):
             m = g[g["AGENCIA_NORM"] == ag]
             return (m["PRECO_MIN"].min() if not m.empty else _np.nan)
         return _pd.Series({
             "Trecho": g["TRECHO"].iloc[0] if len(g) else "-",
-            "Agencia Top 1": name(0),
-            "Preço Top 1": price(0),
-            "Agencia Top 2": name(1),
-            "Preço Top 2": price(1),
-            "Agencia Top 3": name(2),
-            "Preço Top 3": price(2),
-            "123milhas": price_of(A_123),
-            "Maxmilhas": price_of(A_MAX),
-            "FlipMilhas": price_of(A_FLIP),
-            "Capo Viagens": price_of(A_CAPO),
+            "Agencia Top 1": name(0), "Preço Top 1": price(0),
+            "Agencia Top 2": name(1), "Preço Top 2": price(1),
+            "Agencia Top 3": name(2), "Preço Top 3": price(2),
+            "123milhas": price_of(A_123), "Maxmilhas": price_of(A_MAX),
+            "FlipMilhas": price_of(A_FLIP), "Capo Viagens": price_of(A_CAPO),
         })
+
     t1 = by_ag.groupby("TRECHO").apply(_row_top3).reset_index(drop=True)
     preco_cols = ["Preço Top 1","Preço Top 2","Preço Top 3","123milhas","Maxmilhas","FlipMilhas","Capo Viagens"]
     for c in preco_cols:
         t1[c] = _pd.to_numeric(t1[c], errors="coerce").round(0).astype("Int64")
     t1.index = _np.arange(1, len(t1) + 1); t1.index.name = "#"
+
     st.markdown("**Ranking Top 3 (Agências)**")
     fmt_map_t1 = {c: "{:,.0f}" for c in preco_cols}
     sty1 = (
         t1.style.format(fmt_map_t1, na_rep="-", decimal=",", thousands=".")
-        .set_table_styles([{"selector":"tbody td, th","props":[("border","1px solid #EEE")]}])
-        .set_properties(**{"background-color":"#ffffff","color":"#111111"})
+          .set_table_styles([{"selector":"tbody td, th","props":[("border","1px solid #EEE")]}])
+          .set_properties(**{"background-color":"#ffffff","color":"#111111"})
     )
     for c in ["Preço Top 1","Preço Top 2","Preço Top 3"]:
         sty1 = style_heatmap_discrete(sty1, c, SCALE_BLUE)
     sty1 = style_heatmap_discrete(sty1, "123milhas", SCALE_ORANGE)
-    sty1 = style_heatmap_discrete(sty1, "Maxmilhas", SCALE_GREEN)
+    sty1 = style_heatmap_discrete(sty1, "Maxmilhas",  SCALE_GREEN)
     sty1 = style_heatmap_discrete(sty1, "FlipMilhas", SCALE_YELLOW)
     if "Capo Viagens" in t1.columns:
         sty1 = style_heatmap_discrete(sty1, "Capo Viagens", SCALE_PINK)
     if "Capoviagens" in t1.columns:
         sty1 = style_heatmap_discrete(sty1, "Capoviagens", SCALE_PINK)
     st.dataframe(sty1, use_container_width=True)
+
 # ───────────────────────── ABA: Top 3 Agências (END) ─────────────────────────
 
 # ──────────────────── ABA: Top 3 Preços Mais Baratos (START) ─────────────────
 @register_tab("Top 3 Preços Mais Baratos")
 def tab3_top3_precos(df_raw: pd.DataFrame):
-    """
-    Pódio por Trecho → ADVP (mesma pesquisa):
-    • Para CADA (Trecho, ADVP), usa a ÚLTIMA IDPESQUISA daquele par.
-    • Cards Top1/2/3 só dessa pesquisa.
-    • Ícone "?" discreto mostra/copía o ID da pesquisa.
-    """
+    """ Pódio por Trecho → ADVP (mesma pesquisa): usa a ÚLTIMA IDPESQUISA daquele par. """
     import re
     import numpy as _np
     import pandas as _pd
+
     df = render_filters(df_raw, key_prefix="t3")
     st.subheader("Pódio por Trecho → ADVP (última pesquisa de cada par)")
     if df.empty:
         st.info("Sem dados para os filtros.")
         return
-    
-    # Restante da lógica da aba, sem alterações necessárias
+    # … (restante do seu original desta aba)
+
 # ───────────────────── ABA: Top 3 Preços Mais Baratos (END) ──────────────────
 
 # ───────────────────── ABA: Ranking por Agências (START) ─────────────────────
@@ -569,8 +576,8 @@ def tab4_ranking_agencias(df_raw: pd.DataFrame):
     if df.empty:
         st.info("Sem dados para os filtros.")
         return
-    
-    # Restante da lógica da aba, sem alterações necessárias
+    # … (mantido igual ao seu original)
+
 # ───────────────────── ABA: Ranking por Agências (END) ───────────────────────
 
 # ─────────── ABA: Melhor Preço por Período do Dia (START) ───────────
@@ -582,13 +589,14 @@ def tab4_melhor_preco_por_periodo(df_raw: pd.DataFrame):
     import plotly.express as px
     import plotly.graph_objects as go
     import streamlit as st
+
     df = render_filters(df_raw, key_prefix="t4_new")
     st.subheader("Ranking de Melhor Preço por Período do Dia")
     if df.empty:
         st.info("Sem resultados para os filtros selecionados.")
         return
-        
-    # Restante da lógica da aba, sem alterações necessárias
+    # … (mantido igual ao seu original)
+
 # ─────────── ABA: Melhor Preço por Período do Dia (END) ────────────
 
 # ─────────────────────── ABA: Qtde de Buscas x Ofertas (START) ────────────────
@@ -602,6 +610,7 @@ def tab6_buscas_vs_ofertas(df_raw: pd.DataFrame):
     c2.metric("Ofertas (linhas)", fmt_int(offers))
     t = pd.DataFrame({"Métrica": ["Pesquisas", "Ofertas"], "Valor": [searches, offers]})
     st.altair_chart(make_bar(t, "Valor", "Métrica"), use_container_width=True)
+
 # ─────────────────────── ABA: Qtde de Buscas x Ofertas (END) ──────────────────
 
 # ────────────────────────── ABA: Comportamento Cias (START) ───────────────────
@@ -623,6 +632,7 @@ def tab7_comportamento_cias(df_raw: pd.DataFrame):
         tooltip=["TRECHO","AGENCIA_NORM","Share"]
     ).properties(height=320)
     st.altair_chart(chart, use_container_width=True)
+
 # ──────────────────────────── ABA: Comportamento Cias (END) ───────────────────
 
 # ──────────────────────────── ABA: Competitividade (START) ────────────────────
@@ -635,6 +645,7 @@ def tab8_competitividade(df_raw: pd.DataFrame):
     t["DELTA"] = t["PRECO"] - t["BEST"]
     agg = t.groupby("AGENCIA_NORM", as_index=False)["DELTA"].median().rename(columns={"DELTA":"Δ Mediano"})
     st.altair_chart(make_bar(agg, "Δ Mediano", "AGENCIA_NORM"), use_container_width=True)
+
 # ───────────────────────────── ABA: Competitividade (END) ─────────────────────
 
 # ─────────────────────────── ABA: Melhor Preço Diário (START) ─────────────────
@@ -649,6 +660,7 @@ def tab9_melhor_preco_diario(df_raw: pd.DataFrame):
         st.info("Sem dados."); return
     t["Data"] = pd.to_datetime(t["Data"], dayfirst=True)
     st.altair_chart(make_line(t, "Data", "Melhor Preço"), use_container_width=True)
+
 # ────────────────────────────── ABA: Melhor Preço Diário (END) ────────────────
 
 # ─────────────────────────────── ABA: Exportar (START) ────────────────────────
@@ -657,19 +669,29 @@ def tab10_exportar(df_raw: pd.DataFrame):
     df = render_filters(df_raw, key_prefix="t10")
     st.subheader("Exportar dados filtrados")
     csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Baixar CSV (filtro aplicado)", data=csv_bytes, file_name="OFERTAS_filtrado.csv", mime="text/csv")
+    st.download_button("⬇️ Baixar CSV (filtro aplicado)", data=csv_bytes,
+                       file_name="OFERTAS_filtrado.csv", mime="text/csv")
+
 # ───────────────────────────────── ABA: Exportar (END) ────────────────────────
 
 # ================================ ABAS (FIM) ==================================
 
 # =================================== MAIN =====================================
 def main():
-    df_raw = load_base(DATA_PATH)
+    # prepara as chaves de cache (muda quando arquivo muda)
+    legacy_list, new_list = _discover_files()
+    legacy_key = _files_cache_key(legacy_list)
+    new_key    = _files_cache_key(new_list)
+
+    df_raw = load_base(DATA_DIR, legacy_key=legacy_key, new_key=new_key)
+
+    # Banner opcional (mantido)
     for ext in ("*.png","*.jpg","*.jpeg","*.gif","*.webp"):
         imgs = list(APP_DIR.glob(ext))
         if imgs:
             st.image(imgs[0].as_posix(), use_container_width=True)
             break
+
     labels = [label for label, _ in TAB_REGISTRY]
     tabs = st.tabs(labels)
     for i, (label, fn) in enumerate(TAB_REGISTRY):
