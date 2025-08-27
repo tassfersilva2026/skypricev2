@@ -28,17 +28,12 @@ jobs:
       - name: Compute run timestamp (America/Sao_Paulo)
         run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
 
-      - name: Write & validate Service Account JSON
+      - name: Write sa.json (from secret)
         run: |
           if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
             echo "ERRO: configure o secret GDRIVE_SERVICE_ACCOUNT_JSON"; exit 1
           fi
-          printf '%s' "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
-          python - <<'PY'
-          import json
-          json.load(open('sa.json'))
-          print("Service Account JSON OK")
-          PY
+          printf "%s" "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
 
       - name: Pull PDFs do Drive (TESTE: 3 arquivos)
         env:
@@ -48,8 +43,7 @@ jobs:
             echo "ERRO: configure o secret DRIVE_FOLDER_ID"; exit 1
           fi
           python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
-          echo "---- inbox ----"
-          ls -lah inbox || true
+          echo "---- inbox ----"; ls -lah inbox || true
 
       - name: Extrair e gerar Parquet+XLS (TESTE 3)
         env:
