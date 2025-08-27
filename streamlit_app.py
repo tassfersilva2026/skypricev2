@@ -14,9 +14,10 @@ st.set_page_config(page_title="Skyscanner — Painel", layout="wide", initial_si
 APP_DIR   = Path(__file__).resolve().parent
 DATA_DIR  = APP_DIR / "data"
 
-# Cortes de origem de dados
+# ======= Corte de origem de dados =======
 LEGACY_FILE = DATA_DIR / "OFERTASLEGADO.parquet"
 CUTOFF_TS   = pd.Timestamp("2025-08-26 14:00:00")  # 26/08/2025 14:00
+MAX_NEW_FILES = 80  # “modo seguro”: lê só os N mais recentes; ajuste se quiser
 
 # ============================== UTILIDADES GERAIS ==============================
 
@@ -81,14 +82,13 @@ def _rename_minimal(df: pd.DataFrame) -> pd.DataFrame:
         11: "ADVP",
         12: "RANKING"
     }
-    # renomeia pelo índice se necessário (backward compat)
     if list(df.columns[:13]) != list(colmap.values()):
         rename = {df.columns[i]: colmap[i] for i in range(min(13, df.shape[1]))}
         df = df.rename(columns=rename)
     return df
 
 def _normalize_final(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica todas as normalizações do app original."""
+    """Aplica normalizações (horas, datas, preço, ADVP, CIA, agência)."""
     for c in ["HORA_BUSCA", "HORA_PARTIDA", "HORA_CHEGADA"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c].astype(str).str.strip(), errors="coerce").dt.strftime("%H:%M:%S")
@@ -107,35 +107,51 @@ def _normalize_final(df: pd.DataFrame) -> pd.DataFrame:
         df["RANKING"] = pd.to_numeric(df["RANKING"], errors="coerce").astype("Int64")
     df["AGENCIA_NORM"] = df["AGENCIA_COMP"].apply(std_agencia)
     df["ADVP_CANON"]   = df["ADVP"].apply(advp_nearest)
-    # NOVO: normalização de Cia
     df["CIA_NORM"]     = df.get("CIA", pd.Series([None]*len(df))).apply(std_cia)
     return df
 
+# ======= Descoberta de arquivos e chaves de cache =======
 def _discover_files() -> tuple[list[Path], list[Path]]:
-    """Retorna (legacy_files, new_files) conforme regra."""
     legacy = [LEGACY_FILE] if LEGACY_FILE.exists() else []
-    new_files = sorted(DATA_DIR.glob("OFERTAS_*.parquet"))
+    new_files = sorted(
+        (p for p in DATA_DIR.glob("OFERTAS_*.parquet") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,  # mais novos por último
+    )
     return (legacy, new_files)
 
 def _files_cache_key(paths: list[Path]) -> tuple[str, ...]:
-    """Gera uma chave de cache dependente de nomes e mtimes."""
-    return tuple(f"{p.name}:{(p.stat().st_mtime_ns if p.exists() else 0)}" for p in sorted(paths, key=lambda x: x.name))
+    # nome + mtime; se mudar, invalida o cache
+    try:
+        return tuple(f"{p.name}:{p.stat().st_mtime_ns}" for p in paths)
+    except Exception:
+        return tuple(p.name for p in paths)
 
-@st.cache_data(show_spinner=True)
-def load_base(data_dir: Path, legacy_key: tuple[str, ...], new_key: tuple[str, ...]) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_base(
+    data_dir: Path,
+    legacy_paths_key: tuple[str, ...],
+    new_paths_key: tuple[str, ...],
+    limit_new: int | None = MAX_NEW_FILES,
+) -> pd.DataFrame:
     """Carrega dados combinando legado (< cutoff) e novos (>= cutoff)."""
-    # Lê legado (apenas < CUTOFF_TS)
     frames: list[pd.DataFrame] = []
+
+    # --- Lê LEGADO (< CUTOFF_TS) ---
     if LEGACY_FILE.exists():
         df_leg = pd.read_parquet(LEGACY_FILE)
         df_leg = _rename_minimal(df_leg)
-        # precisamos do DATAHORA_BUSCA parseado para filtrar
         df_leg["DATAHORA_BUSCA"] = pd.to_datetime(df_leg["DATAHORA_BUSCA"], errors="coerce", dayfirst=True)
         df_leg = df_leg[df_leg["DATAHORA_BUSCA"] < CUTOFF_TS]
-        frames.append(df_leg)
+        if not df_leg.empty:
+            frames.append(df_leg)
 
-    # Lê novos arquivos (apenas >= CUTOFF_TS)
-    new_files = sorted(data_dir.glob("OFERTAS_*.parquet"))
+    # --- Lê NOVOS (>= CUTOFF_TS) ---
+    new_files_all = sorted(
+        (p for p in data_dir.glob("OFERTAS_*.parquet") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    new_files = new_files_all[-limit_new:] if (limit_new and len(new_files_all) > limit_new) else new_files_all
+
     for p in new_files:
         try:
             dfn = pd.read_parquet(p)
@@ -145,19 +161,17 @@ def load_base(data_dir: Path, legacy_key: tuple[str, ...], new_key: tuple[str, .
             if not dfn.empty:
                 frames.append(dfn)
         except Exception as e:
+            # não trava o app: avisa e segue
             st.warning(f"Falha ao ler {p.name}: {e}")
 
     if not frames:
-        # fallback: avisa e interrompe
-        missing = " e ".join([
-            "OFERTASLEGADO.parquet ausente" if not LEGACY_FILE.exists() else "",
-            "nenhum OFERTAS_*.parquet encontrado" if len(new_files) == 0 else ""
-        ]).strip(" e ")
-        st.error("Nenhum dado carregado. " + (missing or ""))
+        msg = []
+        if not LEGACY_FILE.exists(): msg.append("OFERTASLEGADO.parquet ausente")
+        if len(new_files_all) == 0: msg.append("nenhum OFERTAS_*.parquet encontrado")
+        st.error("Nenhum dado carregado" + (": " + " / ".join(msg) if msg else "."))
         st.stop()
 
     df = pd.concat(frames, ignore_index=True)
-    # Normalização final (igual ao original)
     df = _normalize_final(df)
     return df
 
@@ -552,8 +566,11 @@ def tab2_top3_agencias(df_raw: pd.DataFrame):
 # ──────────────────── ABA: Top 3 Preços Mais Baratos (START) ─────────────────
 @register_tab("Top 3 Preços Mais Baratos")
 def tab3_top3_precos(df_raw: pd.DataFrame):
-    """ Pódio por Trecho → ADVP (mesma pesquisa): usa a ÚLTIMA IDPESQUISA daquele par. """
-    import re
+    """
+    Pódio por Trecho → ADVP (mesma pesquisa):
+      • Para cada (Trecho, ADVP_CANON), usa a ÚLTIMA DATAHORA_BUSCA daquele par.
+      • Exibe os Top 3 preços (agência e valor) dessa pesquisa.
+    """
     import numpy as _np
     import pandas as _pd
 
@@ -562,40 +579,106 @@ def tab3_top3_precos(df_raw: pd.DataFrame):
     if df.empty:
         st.info("Sem dados para os filtros.")
         return
-    # … (restante do seu original desta aba)
+
+    # última pesquisa por (TRECHO, ADVP_CANON)
+    last_dt = (
+        df.groupby(["TRECHO","ADVP_CANON"], as_index=False)["DATAHORA_BUSCA"]
+          .max()
+          .rename(columns={"DATAHORA_BUSCA":"DT_REF"})
+    )
+    cur = df.merge(last_dt, on=["TRECHO","ADVP_CANON"], how="inner")
+    cur = cur[cur["DATAHORA_BUSCA"] == cur["DT_REF"]]
+
+    # menor preço por agência dentro da pesquisa
+    gmin = (cur.groupby(["TRECHO","ADVP_CANON","AGENCIA_NORM"], as_index=False)
+               .agg(PRECO_MIN=("PRECO","min")))
+
+    def top3_rows(g: _pd.DataFrame) -> _pd.Series:
+        g = g.sort_values("PRECO_MIN", ascending=True).reset_index(drop=True)
+        def ag(i): return g.loc[i, "AGENCIA_NORM"] if i < len(g) else "-"
+        def pr(i): return g.loc[i, "PRECO_MIN"] if i < len(g) else _np.nan
+        return _pd.Series({
+            "Trecho": g["TRECHO"].iloc[0] if len(g) else "-",
+            "ADVP": int(g["ADVP_CANON"].iloc[0]) if len(g) else _np.nan,
+            "Agência Top 1": ag(0), "Preço Top 1": pr(0),
+            "Agência Top 2": ag(1), "Preço Top 2": pr(1),
+            "Agência Top 3": ag(2), "Preço Top 3": pr(2),
+        })
+
+    t = gmin.groupby(["TRECHO","ADVP_CANON"]).apply(top3_rows).reset_index(drop=True)
+    for c in ["Preço Top 1","Preço Top 2","Preço Top 3"]:
+        t[c] = pd.to_numeric(t[c], errors="coerce").round(0).astype("Int64")
+    t = t.sort_values(["Trecho","ADVP"])
+    st.dataframe(t, use_container_width=True)
 
 # ───────────────────── ABA: Top 3 Preços Mais Baratos (END) ──────────────────
 
 # ───────────────────── ABA: Ranking por Agências (START) ─────────────────────
 @register_tab("Ranking por Agências")
 def tab4_ranking_agencias(df_raw: pd.DataFrame):
-    import numpy as np
-    import pandas as pd
     df = render_filters(df_raw, key_prefix="t4")
     st.subheader("Ranking por Agências (1º ao 15º)")
     if df.empty:
         st.info("Sem dados para os filtros.")
         return
-    # … (mantido igual ao seu original)
+
+    # Contagem de posições 1,2,3 por agência (por IDPESQUISA)
+    pos = (df[df["RANKING"].isin([1,2,3])]
+           .groupby(["AGENCIA_NORM","RANKING"])["IDPESQUISA"]
+           .nunique().rename("Qtde").reset_index())
+
+    # Tabela pivô
+    piv = pos.pivot(index="AGENCIA_NORM", columns="RANKING", values="Qtde").fillna(0).astype(int)
+    piv = piv.rename(columns={1:"Top1",2:"Top2",3:"Top3"}).reset_index()
+    piv["Total Top1-3"] = piv[["Top1","Top2","Top3"]].sum(axis=1)
+    piv = piv.sort_values(["Top1","Top2","Top3","AGENCIA_NORM"], ascending=[False,False,False,True])
+
+    # Gráfico Top 1 (Top 15)
+    top15 = piv.sort_values("Top1", ascending=False).head(15)
+    st.altair_chart(make_bar(top15, "Top1", "AGENCIA_NORM"), use_container_width=True)
+    st.dataframe(piv, use_container_width=True)
 
 # ───────────────────── ABA: Ranking por Agências (END) ───────────────────────
 
 # ─────────── ABA: Melhor Preço por Período do Dia (START) ───────────
 @register_tab("Melhor Preço por Período do Dia")
 def tab4_melhor_preco_por_periodo(df_raw: pd.DataFrame):
-    import re
-    import numpy as np
-    import pandas as pd
-    import plotly.express as px
-    import plotly.graph_objects as go
-    import streamlit as st
-
     df = render_filters(df_raw, key_prefix="t4_new")
     st.subheader("Ranking de Melhor Preço por Período do Dia")
     if df.empty:
         st.info("Sem resultados para os filtros selecionados.")
         return
-    # … (mantido igual ao seu original)
+
+    # Define períodos
+    def periodo(hh: int) -> str:
+        if pd.isna(hh): return "N/D"
+        hh = int(hh)
+        if 0 <= hh <= 5:   return "Madrugada (0–5)"
+        if 6 <= hh <= 11:  return "Manhã (6–11)"
+        if 12 <= hh <= 17: return "Tarde (12–17)"
+        return "Noite (18–23)"
+
+    df["_PERIODO"] = df["HORA_HH"].apply(periodo)
+
+    # Para cada IDPESQUISA, quem ganhou (menor preço)
+    best = (df.sort_values(["IDPESQUISA","PRECO"])
+              .groupby("IDPESQUISA").first()
+              .reset_index()[["IDPESQUISA","AGENCIA_NORM"]])
+    best = best.merge(df[["IDPESQUISA","_PERIODO"]].drop_duplicates(), on="IDPESQUISA", how="left")
+
+    # Share de vitórias por período
+    base = (best.groupby(["_PERIODO","AGENCIA_NORM"]).size()
+                 .rename("Vitorias").reset_index())
+    total_p = base.groupby("_PERIODO")["Vitorias"].transform("sum")
+    base["Share"] = (base["Vitorias"]/total_p*100).round(2)
+
+    chart = alt.Chart(base).mark_bar().encode(
+        x=alt.X("Share:Q", stack="normalize", axis=alt.Axis(format="%")),
+        y=alt.Y("_PERIODO:N", sort="-x", title="Período do dia"),
+        color=alt.Color("AGENCIA_NORM:N"),
+        tooltip=["_PERIODO","AGENCIA_NORM","Share"]
+    ).properties(height=320)
+    st.altair_chart(chart, use_container_width=True)
 
 # ─────────── ABA: Melhor Preço por Período do Dia (END) ────────────
 
@@ -678,12 +761,26 @@ def tab10_exportar(df_raw: pd.DataFrame):
 
 # =================================== MAIN =====================================
 def main():
-    # prepara as chaves de cache (muda quando arquivo muda)
     legacy_list, new_list = _discover_files()
     legacy_key = _files_cache_key(legacy_list)
     new_key    = _files_cache_key(new_list)
 
-    df_raw = load_base(DATA_DIR, legacy_key=legacy_key, new_key=new_key)
+    with st.status("Carregando dados…", expanded=True) as s:
+        st.write(f"📂 Pasta: `{DATA_DIR.as_posix()}`")
+        st.write(f"🕘 Corte: **{CUTOFF_TS}**")
+        st.write(f"🗄️ Legado: {len(legacy_list)} arquivo(s) | Novos detectados: {len(new_list)}")
+
+        if len(new_list) > MAX_NEW_FILES:
+            st.info(f"Modo seguro: carregando somente os **{MAX_NEW_FILES}** arquivos mais recentes de `OFERTAS_*.parquet`.")
+
+        df_raw = load_base(DATA_DIR, legacy_key, new_key, limit_new=MAX_NEW_FILES)
+
+        # Telemetria pós-load
+        linhas = len(df_raw)
+        dmin = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").min()
+        dmax = pd.to_datetime(df_raw["DATAHORA_BUSCA"], errors="coerce").max()
+        st.write(f"✅ Linhas carregadas: **{fmt_int(linhas)}** | Intervalo DATAHORA_BUSCA: {dmin} → {dmax}")
+        s.update(label="Dados carregados", state="complete")
 
     # Banner opcional (mantido)
     for ext in ("*.png","*.jpg","*.jpeg","*.gif","*.webp"):
