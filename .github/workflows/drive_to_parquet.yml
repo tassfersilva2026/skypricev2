@@ -1,19 +1,28 @@
-name: Drive to Parquet (TESTE 3 PDFs)
+name: drive-to-parquet
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"   # a cada 30 minutos
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TZ: America/Sao_Paulo
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      TZ: America/Sao_Paulo
-      PYTHONUTF8: "1"
+    concurrency:
+      group: drive-to-parquet
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -23,59 +32,74 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* google-api-python-client==2.* google-auth==2.*
+          pip install -r requirements.txt
 
-      - name: Compute RUN_TS (America/Sao_Paulo)
-        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +%Y-%m-%d_%H-%M-%S)" >> $GITHUB_ENV
-
-      - name: Write sa.json (from secret)
+      - name: Ensure folders
         run: |
-          if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
-            echo "ERRO: configure o secret GDRIVE_SERVICE_ACCOUNT_JSON"; exit 1
-          fi
-          printf '%s' "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
+          mkdir -p inbox data out state
 
+      - name: Compute run timestamp (America/Sao_Paulo)
+        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
+
+      # ====== GRAVAÇÃO SEGURA DO sa.json (sem echo) ======
+      - name: Write Service Account JSON (safe heredoc)
+        run: |
+          cat > sa.json <<'JSON'
+          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          JSON
+
+      # Valida o JSON sem imprimir o conteúdo
       - name: Validate sa.json
         run: |
-          python -c "import json; json.load(open('sa.json')); print('Service Account JSON OK')"
+          python - << 'PY'
+          import json,sys
+          json.load(open('sa.json'))
+          print("Service Account JSON OK")
+          PY
 
-      - name: Pull PDFs do Drive (TESTE: 3 arquivos)
+      - name: Pull PDFs do Drive (desde 26/08/2025 14:00:00 SP) sem repetir
         env:
-          MAX_FILES: "3"
+          CUTOVER_SP: "2025-08-26T14:00:00"
+          TZ_NAME: "America/Sao_Paulo"
         run: |
           if [ -z "${{ secrets.DRIVE_FOLDER_ID }}" ]; then
-            echo "ERRO: configure o secret DRIVE_FOLDER_ID"; exit 1
+            echo "ERRO: Secret DRIVE_FOLDER_ID ausente (repo Settings > Secrets and variables > Actions)."
+            exit 1
           fi
+          # passa o ID como argumento para evitar depender de env
           python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
-          echo "---- inbox ----"
-          ls -lah inbox || true
 
-      - name: Extrair e gerar Parquet+XLS (TESTE 3)
+      - name: Extrair e gerar Parquet+XLS por rodada (sem repetir)
         env:
           PDF_DIR: inbox
-          WRITE_SINGLE_RUN_PARQUET: "1"
-          WRITE_XLS_ARTIFACT: "1"
-          TZ_NAME: America/Sao_Paulo
+          WRITE_SINGLE_RUN_PARQUET: "1"     # data/OFERTAS_YYYY-MM-DD_HH:MM:SS.parquet
+          WRITE_XLS_ARTIFACT: "1"           # out/OFERTAS_RUN_YYYY-MM-DD_HH-MM-SS.xlsx
+          TZ_NAME: "America/Sao_Paulo"
           RUN_TS: ${{ env.RUN_TS }}
         run: |
-          python scripts/PDF27.pyw --once --limit 3
-          echo "---- data/ ----"; ls -lah data || true
-          echo "---- out/  ----"; ls -lah out  || true
+          python scripts/PDF27.pyw --once
 
-      - name: Upload XLS (artefato)
+      - name: Upload XLS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OFERTAS_XLS_${{ env.RUN_TS }}
-          path: out/*.xlsx
-          if-no-files-found: warn
-          retention-days: 7
+          name: OFERTAS_${{ env.RUN_TS }}.xlsx
+          path: out/OFERTAS_RUN_${{ env.RUN_TS }}.xlsx
+          if-no-files-found: error
 
-      - name: Upload Parquets
-        uses: actions/upload-artifact@v4
-        with:
-          name: OFERTAS_PARQUETS_${{ env.RUN_TS }}
-          path: |
-            data/*.parquet
-            out/*.parquet
-          if-no-files-found: warn
-          retention-days: 7
+      - name: Commit & Push (somente data/ + state/)
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add data/*.parquet state/*.json || true
+            git commit -m "chore(parquet): OFERTAS @ ${GITHUB_RUN_NUMBER}"
+            git push
+            echo "Changes pushed."
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Limpeza inbox (artefatos efêmeros)
+        if: always()
+        run: rm -rf inbox || true
