@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      PYTHONUTF8: "1"
       TZ: America/Sao_Paulo
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout
@@ -28,43 +28,52 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* google-api-python-client==2.* google-auth==2.*
+          pip install \
+            pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* \
+            google-api-python-client==2.* google-auth==2.* google-auth-httplib2==0.*
 
       - name: Compute run timestamp (America/Sao_Paulo)
-        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
+        shell: bash
+        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> "$GITHUB_ENV"
 
-      # --- grava a chave do Service Account em sa.json (com validação) ---
+      # ====== Gravação segura do sa.json (sem YAML malformado) ======
       - name: Write Service Account JSON
+        shell: bash
         run: |
           if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
             echo "ERRO: configure o secret GDRIVE_SERVICE_ACCOUNT_JSON (conteúdo do JSON do Service Account)"; exit 1
           fi
-          cat > sa.json <<'JSON'
-          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          JSON
+          # grava o JSON exatamente como veio do secret (quebra de linha preservada)
+          printf '%s' "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
 
       - name: Validate sa.json
+        shell: bash
         run: |
           python - << 'PY'
-          import json; json.load(open('sa.json')); print("Service Account JSON OK")
+          import json
+          json.load(open('sa.json'))
+          print("Service Account JSON OK")
           PY
 
-      # --- PULL: baixa só 3 PDFs do Drive (e não repete nomes que já constam na base) ---
-      - name: Pull PDFs do Drive (TESTE: só 3 arquivos)
+      # ====== Pull: baixa SÓ 3 PDFs (e não repete os já conhecidos) ======
+      - name: Pull PDFs do Drive (TESTE: 3 arquivos)
+        shell: bash
         env:
-          MAX_FILES: "3"  # <- pega no máx. 3 mais recentes
+          MAX_FILES: "3"  # <- limita o scripts/drive_pull.py a 3 arquivos
         run: |
           if [ -z "${{ secrets.DRIVE_FOLDER_ID }}" ]; then
             echo "ERRO: configure o secret DRIVE_FOLDER_ID (ID da pasta no Drive)"; exit 1
           fi
           python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
-          echo "---- inbox baixada ----"
+          echo "---- inbox ----"
           ls -lah inbox || true
 
-      # --- EXTRAÇÃO: processa só 3 PDFs e gera Parquet+XLS por rodada ---
-      - name: Extrair e gerar Parquet+XLS (TESTE: só 3)
+      # ====== Extração: processa só 3 PDFs e gera Parquet + XLS do run ======
+      - name: Extrair e gerar Parquet+XLS (TESTE: 3 arquivos)
+        shell: bash
         env:
           PDF_DIR: inbox
           WRITE_SINGLE_RUN_PARQUET: "1"
@@ -78,13 +87,12 @@ jobs:
           echo "---- out/ ----"
           ls -lah out || true
 
-      # --- Artefatos: XLS do run e todos Parquets gerados ---
+      # ====== Artefatos ======
       - name: Upload XLS (artefato do run)
         uses: actions/upload-artifact@v4
         with:
           name: OFERTAS_XLS_${{ env.RUN_TS }}
-          path: |
-            out/*.xlsx
+          path: out/*.xlsx
           if-no-files-found: warn
           retention-days: 7
 
