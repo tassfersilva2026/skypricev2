@@ -23,28 +23,23 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* \
-            google-api-python-client==2.* google-auth==2.* google-auth-httplib2==0.*
+          pip install pandas==2.* pdfplumber==0.* tqdm==4.* openpyxl==3.* pyarrow==17.* google-api-python-client==2.* google-auth==2.* google-auth-httplib2==0.*
 
       - name: Compute run timestamp (America/Sao_Paulo)
-        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> "$GITHUB_ENV"
+        run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
 
-      # ----- grava e valida sa.json (sem malformar YAML) -----
       - name: Write & validate Service Account JSON
         run: |
           if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
             echo "ERRO: configure o secret GDRIVE_SERVICE_ACCOUNT_JSON"; exit 1
           fi
+          printf '%s' "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
           python - <<'PY'
-          import json, sys
-          raw = r'''${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}'''
-          open("sa.json","w",encoding="utf-8").write(raw)
-          json.loads(raw)  # valida
+          import json
+          json.load(open('sa.json'))
           print("Service Account JSON OK")
           PY
 
-      # ----- PULL: baixa SÓ 3 PDFs -----
       - name: Pull PDFs do Drive (TESTE: 3 arquivos)
         env:
           MAX_FILES: "3"
@@ -56,7 +51,6 @@ jobs:
           echo "---- inbox ----"
           ls -lah inbox || true
 
-      # ----- EXTRAÇÃO: processa SÓ 3 PDFs e gera Parquet + XLS -----
       - name: Extrair e gerar Parquet+XLS (TESTE 3)
         env:
           PDF_DIR: inbox
@@ -69,7 +63,6 @@ jobs:
           echo "---- data/ ----"; ls -lah data || true
           echo "---- out/  ----"; ls -lah out  || true
 
-      # ----- Artefatos do run -----
       - name: Upload XLS (artefato)
         uses: actions/upload-artifact@v4
         with:
