@@ -596,4 +596,189 @@ def tab2_top3_agencias(df_raw: pd.DataFrame):
     g = (df2.dropna(subset=["TRECHO","IDPESQUISA","DT"])
               .groupby(["TRECHO","IDPESQUISA"], as_index=False)["DT"].max())
     last_idx = g.groupby("TRECHO")["DT"].idxmax()
-    last_ids = {r["TRECHO"]: r["IDPESQUISA"] for _, r in g.loc[last_idx].iterrow_]()
+    last_ids = {r["TRECHO"]: r["IDPESQUISA"] for _, r in g.loc[last_idx].iterrows()}
+    df2["__ID_TARGET__"] = df2["TRECHO"].map(last_ids)
+    df_last = df2[df2["IDPESQUISA"].astype(str) == df2["__ID_TARGET__"].astype(str)].copy()
+
+    def _compose_dt_hora(sub: pd.DataFrame) -> str:
+        d = pd.to_datetime(sub["DATAHORA_BUSCA"], errors="coerce").max()
+        hh = None
+        for v in sub["HORA_BUSCA"].tolist():
+            hh = _norm_hhmmss(v)
+            if hh: break
+        if pd.isna(d) and not hh: return "-"
+        if not hh: hh = pd.to_datetime(d, errors="coerce").strftime("%H:%M:%S")
+        return f"{d.strftime('%d/%m/%Y')} {hh}"
+    dt_by_trecho = {trecho: _compose_dt_hora(sub) for trecho, sub in df_last.groupby("TRECHO")}
+
+    PRICE_COL, TRECHO_COL, AGENCIA_COL = "PRECO", "TRECHO", "AGENCIA_NORM"
+    by_ag = (
+        df_last.groupby([TRECHO_COL, AGENCIA_COL], as_index=False)
+               .agg(PRECO_MIN=(PRICE_COL, "min"))
+               .rename(columns={TRECHO_COL:"TRECHO_STD", AGENCIA_COL:"AGENCIA_UP"})
+    )
+
+    def _row_top3(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("PRECO_MIN", ascending=True).reset_index(drop=True)
+        trecho = g["TRECHO_STD"].iloc[0] if len(g) else "-"
+        def name(i):  return g.loc[i, "AGENCIA_UP"] if i < len(g) else "-"
+        def price(i): return g.loc[i, "PRECO_MIN"]  if i < len(g) else np.nan
+        return pd.Series({
+            "Data/Hora Busca": dt_by_trecho.get(trecho, "-"),
+            "Trecho": trecho,
+            "Agencia Top 1": name(0), "Preço Top 1": price(0),
+            "Agencia Top 2": name(1), "Preço Top 2": price(1),
+            "Agencia Top 3": name(2), "Preço Top 3": price(2),
+        })
+
+    t1 = by_ag.groupby("TRECHO_STD").apply(_row_top3).reset_index(drop=True)
+    for c in ["Preço Top 1","Preço Top 2","Preço Top 3"]:
+        t1[c] = pd.to_numeric(t1[c], errors="coerce")
+    sty1 = style_smart_colwise(t1, {c: fmt_num0_br for c in ["Preço Top 1","Preço Top 2","Preço Top 3"]},
+                               grad_cols=["Preço Top 1","Preço Top 2","Preço Top 3"])
+    show_table(t1, sty1, caption="Ranking Top 3 (Agências) — por trecho")
+
+    def pct_diff(base, other):
+        if pd.isna(base) or base == 0 or pd.isna(other): return np.nan
+        return (other - base) / base * 100
+
+    rows2 = []
+    for _, r in t1.iterrows():
+        base = r["Preço Top 1"]
+        rows2.append({
+            "Data/Hora Busca": r["Data/Hora Busca"],
+            "Trecho": r["Trecho"],
+            "Agencia Top 1": r["Agencia Top 1"], "Preço Top 1": base,
+            "Agencia Top 2": r["Agencia Top 2"], "% Dif Top2 vs Top1": pct_diff(base, r["Preço Top 2"]),
+            "Agencia Top 3": r["Agencia Top 3"], "% Dif Top3 vs Top1": pct_diff(base, r["Preço Top 3"]),
+        })
+    t2 = pd.DataFrame(rows2).reset_index(drop=True)
+    sty2 = style_smart_colwise(
+        t2,
+        {"Preço Top 1": fmt_num0_br, "% Dif Top2 vs Top1": fmt_pct2_br, "% Dif Top3 vs Top1": fmt_pct2_br},
+        grad_cols=["Preço Top 1", "% Dif Top2 vs Top1", "% Dif Top3 vs Top1"]
+    )
+    show_table(t2, sty2, caption="% Diferença entre Agências (base: TOP1)")
+
+@register_tab("Ranking por Agências")
+def tab4_ranking_agencias(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t4")
+    st.subheader("Ranking por Agências (1º ao 15º)")
+    if df.empty: st.info("Sem dados."); return
+    wins = (df[df["RANKING"].eq(1)].groupby("AGENCIA_NORM", as_index=False).size().rename(columns={"size":"Top1 Wins"}))
+    wins = wins.sort_values("Top1 Wins", ascending=False)
+    top15 = wins.head(15).reset_index(drop=True)
+    sty = style_smart_colwise(top15, {"Top1 Wins": fmt_num0_br}, grad_cols=["Top1 Wins"])
+    show_table(top15, sty, caption="Top 15 — Contagem de 1º lugar por Agência")
+    st.altair_chart(make_bar(top15, "Top1 Wins", "AGENCIA_NORM"), use_container_width=True)
+
+@register_tab("Qtde de Buscas x Ofertas")
+def tab6_buscas_vs_ofertas(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t6")
+    st.subheader("Quantidade de Buscas x Ofertas")
+    searches = df["IDPESQUISA"].nunique(); offers = len(df)
+    c1, c2 = st.columns(2)
+    c1.metric("Pesquisas únicas", fmt_int(searches))
+    c2.metric("Ofertas (linhas)", fmt_int(offers))
+    t = pd.DataFrame({"Métrica": ["Pesquisas", "Ofertas"], "Valor": [searches, offers]})
+    st.altair_chart(make_bar(t, "Valor", "Métrica"), use_container_width=True)
+
+@register_tab("Comportamento Cias")
+def tab7_comportamento_cias(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t7")
+    st.subheader("Comportamento Cias (share por Trecho)")
+    base = df.groupby(["TRECHO","AGENCIA_NORM"]).size().rename("Qtde").reset_index()
+    if base.empty: st.info("Sem dados."); return
+    top_trechos = base.groupby("TRECHO")["Qtde"].sum().sort_values(ascending=False).head(10).index.tolist()
+    base = base[base["TRECHO"].isin(top_trechos)]
+    total_trecho = base.groupby("TRECHO")["Qtde"].transform("sum")
+    base["Share"] = (base["Qtde"]/total_trecho*100).round(2)
+    chart = alt.Chart(base).mark_bar().encode(
+        x=alt.X("Share:Q", stack="normalize", axis=alt.Axis(format="%")),
+        y=alt.Y("TRECHO:N", sort="-x"),
+        color=alt.Color("AGENCIA_NORM:N"),
+        tooltip=["TRECHO","AGENCIA_NORM","Share"]
+    ).properties(height=320)
+    st.altair_chart(chart, use_container_width=True)
+
+@register_tab("Competitividade")
+def tab8_competitividade(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t8")
+    st.subheader("Competitividade (Δ mediano vs melhor preço por pesquisa)")
+    best = df.groupby("IDPESQUISA")["PRECO"].min().rename("BEST").reset_index()
+    t = df.merge(best, on="IDPESQUISA", how="left")
+    t["DELTA"] = t["PRECO"] - t["BEST"]
+    agg = t.groupby("AGENCIA_NORM", as_index=False)["DELTA"].median().rename(columns={"DELTA":"Δ Mediano"})
+    st.altair_chart(make_bar(agg, "Δ Mediano", "AGENCIA_NORM"), use_container_width=True)
+
+@register_tab("Melhor Preço Diário")
+def tab9_melhor_preco_diario(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t9")
+    st.subheader("Melhor Preço Diário (col. H - Data da busca)")
+    t = df.groupby(df["DATAHORA_BUSCA"].dt.date, as_index=False)["PRECO"].min().rename(
+        columns={"DATAHORA_BUSCA":"Data","PRECO":"Melhor Preço"}
+    )
+    if t.empty: st.info("Sem dados."); return
+    t["Data"] = pd.to_datetime(t["Data"], dayfirst=True)
+    st.altair_chart(make_line(t, "Data", "Melhor Preço"), use_container_width=True)
+
+@register_tab("Exportar")
+def tab10_exportar(df_raw: pd.DataFrame):
+    df = render_filters(df_raw, key_prefix="t10")
+    st.subheader("Exportar dados filtrados")
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Baixar CSV (filtro aplicado)", data=csv_bytes, file_name="OFERTAS_filtrado.csv", mime="text/csv")
+
+# =================================== MAIN =====================================
+def main():
+    # Banner leve (se tiver imagem solta em scripts/)
+    for ext in ("*.png","*.jpg","*.jpeg","*.gif","*.webp"):
+        imgs = list(APP_DIR.glob(ext))
+        if imgs:
+            st.image(imgs[0].as_posix(), use_container_width=True); break
+
+    try:
+        df_raw = load_base(DATA_DIR)
+    except Exception as e:
+        st.error("Falha ao carregar os dados.")
+        st.exception(e)
+        st.info("Abra a aba **Diagnóstico** abaixo para checar arquivos e prévias.")
+        tabs = st.tabs(["Diagnóstico"])
+        with tabs[0]:
+            st.subheader("Ambiente")
+            st.write({
+                "Python": sys.version.split()[0],
+                "Platform": platform.platform(),
+                "Pandas": pd.__version__,
+                "NumPy": np.__version__,
+                "Altair": alt.__version__,
+                "DATA_DIR": DATA_DIR.as_posix(),
+            })
+            diagnose_data_dir()
+        return
+
+    labels = [label for label, _ in TAB_REGISTRY] + ["Diagnóstico"]
+    tabs = st.tabs(labels)
+
+    for i, (label, fn) in enumerate(TAB_REGISTRY):
+        with tabs[i]:
+            try:
+                fn(df_raw)
+            except Exception as e:
+                st.error(f"Erro na aba {label}")
+                st.exception(e)
+
+    with tabs[-1]:
+        st.subheader("Ambiente")
+        st.write({
+            "Python": sys.version.split()[0],
+            "Platform": platform.platform(),
+            "Pandas": pd.__version__,
+            "NumPy": np.__version__,
+            "Altair": alt.__version__,
+            "DATA_DIR": DATA_DIR.as_posix(),
+        })
+        diagnose_data_dir()
+
+if __name__ == "__main__":
+    main()
