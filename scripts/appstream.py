@@ -1,10 +1,10 @@
 # streamlit_app.py
 from __future__ import annotations
 from pathlib import Path
-from datetime import datetime, date, time as dtime
+from datetime import date, time as dtime
 from typing import Callable, List, Tuple
 
-import sys, platform, re
+import os, sys, platform, re
 from textwrap import dedent
 
 import numpy as np
@@ -15,8 +15,17 @@ import altair as alt
 # ========================== CONFIGURAÇÃO BASE DO APP ==========================
 st.set_page_config(page_title="Skyscanner — Painel", layout="wide", initial_sidebar_state="expanded")
 
-APP_DIR   = Path(__file__).resolve().parent
-DATA_DIR  = APP_DIR / "data"  # lê a pasta data/ na raiz do repo
+APP_DIR = Path(__file__).resolve().parent         # .../scripts
+CWD     = Path.cwd()
+
+# Candidatos para localizar a pasta data/ (suporta vários layouts)
+CANDIDATES = [
+    APP_DIR / "data",         # scripts/data
+    APP_DIR.parent / "data",  # raiz/data   ← seu caso atual
+    CWD / "data",             # data a partir do diretório de execução
+]
+DATA_DIR  = next((p for p in CANDIDATES if p.exists()), APP_DIR.parent / "data")
+DATA_DIR  = Path(os.environ.get("DATA_DIR", str(DATA_DIR)))  # permite override por env var
 CUTOFF_DT = pd.Timestamp("2025-08-26 14:00:00")  # LEGADO < 14:00, INCREMENTAIS >= 14:00
 
 # ============================== UTILIDADES GERAIS ==============================
@@ -60,7 +69,7 @@ def std_cia(raw: str) -> str:
     if s in {"LA", "JJ"} or s.startswith("TAM") or s.startswith("LATAM") or "LATAM" in s_simple or "TAM" in s_simple:
         return "LATAM"
     if s in {"AZUL", "GOL", "LATAM"}: return s
-    return s  # mantém como veio
+    return s
 
 def advp_nearest(x) -> int:
     try: v = float(str(x).replace(",", "."))
@@ -85,7 +94,7 @@ def _normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         rename = {df.columns[i]: colmap[i] for i in range(min(13, df.shape[1]))}
         df = df.rename(columns=rename)
 
-    # Horas como HH:MM:SS (inclui HORA_BUSCA / coluna C)
+    # Horas como HH:MM:SS (inclui HORA_BUSCA / col C)
     for c in ["HORA_BUSCA","HORA_PARTIDA","HORA_CHEGADA"]:
         if c in df.columns:
             parsed = pd.to_datetime(df[c].astype(str).str.strip(), errors="coerce")
@@ -255,7 +264,11 @@ def _blend(c_from, c_to, t):
     f, to = _hex_to_rgb(c_from), _hex_to_rgb(c_to)
     return _rgb_to_hex(tuple(int(round(f[i] + (to[i]-f[i])*t)) for i in range(3)))
 def make_scale(base_hex, steps=5): return [_blend("#ffffff", base_hex, k/(steps-1)) for k in range(steps)]
-SCALE_BLUE, SCALE_ORANGE, SCALE_GREEN, SCALE_YELLOW, SCALE_PINK = map(make_scale, [BLUE, ORANGE, GREEN, YELLOW, PINK])
+SCALE_BLUE   = make_scale(BLUE)
+SCALE_ORANGE = make_scale(ORANGE)
+SCALE_GREEN  = make_scale(GREEN)
+SCALE_YELLOW = make_scale(YELLOW)
+SCALE_PINK   = make_scale(PINK)
 
 def _pick_scale(colname: str):
     u = str(colname).upper()
@@ -507,7 +520,7 @@ def tab1_painel(df_raw: pd.DataFrame):
 
     def pcts_for_target(base_df: pd.DataFrame, tgt: str, agrupado: bool) -> tuple[float,float,float]:
         base = (base_df.replace({
-            "R1": {"MAXMILHAS": "GRURO 123".replace("RO","PO"), "123MILHAS": "GRUPO 123"},
+            "R1": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
             "R2": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
             "R3": {"MAXMILHAS": "GRUPO 123", "123MILHAS": "GRUPO 123"},
         }) if agrupado else base_df)
@@ -587,10 +600,8 @@ def tab2_top3_agencias(df_raw: pd.DataFrame):
         for v in sub["HORA_BUSCA"].tolist():
             hh = _norm_hhmmss(v)
             if hh: break
-        if pd.isna(d) and not hh:
-            return "-"
-        if not hh:
-            hh = pd.to_datetime(d, errors="coerce").strftime("%H:%M:%S")
+        if pd.isna(d) and not hh: return "-"
+        if not hh: hh = pd.to_datetime(d, errors="coerce").strftime("%H:%M:%S")
         return f"{d.strftime('%d/%m/%Y')} {hh}"
     dt_by_trecho = {trecho: _compose_dt_hora(sub) for trecho, sub in df_last.groupby("TRECHO")}
 
@@ -784,7 +795,7 @@ def main():
                 "Pandas": pd.__version__,
                 "NumPy": np.__version__,
                 "Altair": alt.__version__,
-                "PyArrow (via pandas)": "instalado"  # se read_parquet funcionou
+                "DATA_DIR": DATA_DIR.as_posix(),
             })
             diagnose_data_dir()
         return
@@ -810,7 +821,7 @@ def main():
             "Pandas": pd.__version__,
             "NumPy": np.__version__,
             "Altair": alt.__version__,
-            "PyArrow (via pandas)": "instalado"
+            "DATA_DIR": DATA_DIR.as_posix(),
         })
         diagnose_data_dir()
 
