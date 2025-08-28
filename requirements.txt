@@ -12,8 +12,9 @@ pyarrow==17.0.0
 slack_sdk==3.27.1
 streamlit
 tqdm==4.66.5
-
-# opcionais:
-# xlrd==2.0.1     # se for abrir arquivos .xls
-# fastparquet     # se preferir engine parquet alternativa
-# watchdog        # melhor hot-reload do Streamlit
+streamlit
+pandas>=2.1
+pyarrow
+xlrd==2.0.1    
+fastparquet    
+watchdog   
