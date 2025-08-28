@@ -15,17 +15,20 @@ import altair as alt
 # ========================== CONFIGURAÇÃO BASE DO APP ==========================
 st.set_page_config(page_title="Skyscanner — Painel", layout="wide", initial_sidebar_state="expanded")
 
-APP_DIR = Path(__file__).resolve().parent         # .../scripts
-CWD     = Path.cwd()
+APP_DIR = Path(__file__).resolve().parent  # .../data
 
-# Candidatos para localizar a pasta data/ (suporta vários layouts)
+# 🔎 Onde procurar a pasta de dados
 CANDIDATES = [
-    APP_DIR / "data",         # scripts/data
-    APP_DIR.parent / "data",  # raiz/data   ← seu caso atual
-    CWD / "data",             # data a partir do diretório de execução
+    APP_DIR,                 # ✅ app está dentro de /data → use o próprio diretório
+    APP_DIR / "data",        # scripts/data
+    APP_DIR.parent / "data", # raiz/data
+    Path.cwd() / "data",     # data a partir do diretório de execução
 ]
-DATA_DIR  = next((p for p in CANDIDATES if p.exists()), APP_DIR.parent / "data")
-DATA_DIR  = Path(os.environ.get("DATA_DIR", str(DATA_DIR)))  # permite override por env var
+
+# Permite override por variável de ambiente; senão pega o primeiro que existir
+DATA_DIR = Path(os.environ["DATA_DIR"]) if os.environ.get("DATA_DIR") else \
+           next((p for p in CANDIDATES if p.exists()), APP_DIR)
+
 CUTOFF_DT = pd.Timestamp("2025-08-26 14:00:00")  # LEGADO < 14:00, INCREMENTAIS >= 14:00
 
 # ============================== UTILIDADES GERAIS ==============================
@@ -89,9 +92,8 @@ def _normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
     colmap = {0:"IDPESQUISA",1:"CIA",2:"HORA_BUSCA",3:"HORA_PARTIDA",4:"HORA_CHEGADA",
               5:"TIPO_VOO",6:"DATA_EMBARQUE",7:"DATAHORA_BUSCA",8:"AGENCIA_COMP",9:"PRECO",
               10:"TRECHO",11:"ADVP",12:"RANKING"}
-    expected = list(colmap.values())
-    if list(df.columns[:13]) != expected[:min(13, df.shape[1])]:
-        rename = {df.columns[i]: colmap[i] for i in range(min(13, df.shape[1]))}
+    if df.shape[1] >= 13:
+        rename = {df.columns[i]: colmap[i] for i in range(13)}
         df = df.rename(columns=rename)
 
     # Horas como HH:MM:SS (inclui HORA_BUSCA / col C)
@@ -248,6 +250,7 @@ CARD_CSS = """
   .pct{font-size:16px;font-weight:650;}
 </style>
 """
+st.markdown(CARD_CSS, unsafe_allow_html=True)
 
 CARDS_STACK_CSS = """
 <style>
@@ -256,6 +259,7 @@ CARDS_STACK_CSS = """
   .stack-title { font-weight:800; padding:8px 10px; margin:6px 0 10px 0; border-radius:10px; border:1px solid #e9e9ee; background:#f8fafc; color:#0A2A6B; }
 </style>
 """
+st.markdown(CARDS_STACK_CSS, unsafe_allow_html=True)
 
 BLUE  = "#cfe3ff"; ORANGE= "#fdd0a2"; GREEN = "#c7e9c0"; YELLOW= "#fee391"; PINK  = "#f1b6da"
 def _hex_to_rgb(h): return tuple(int(h[i:i+2], 16) for i in (1,3,5))
@@ -486,6 +490,25 @@ def winners_by_position(df: pd.DataFrame) -> pd.DataFrame:
     for r in (1,2,3): base[f"R{r}"] = base[f"R{r}"].fillna("SEM OFERTAS")
     return base
 
+def card_html(name: str, p1: float, p2: float, p3: float, extra_cls: str = "") -> str:
+    def fmt_pct(x):
+        try:
+            v = float(x)
+            if not np.isfinite(v): return "-"
+            return f"{v:.1f}%".replace(".", ",")
+        except Exception:
+            return "-"
+    return f"""
+    <div class="card {extra_cls}">
+      <div class="title">{name}</div>
+      <div class="row">
+        <div class="item"><span class="pos">1º</span><span class="pct">{fmt_pct(p1)}</span></div>
+        <div class="item"><span class="pos">2º</span><span class="pct">{fmt_pct(p2)}</span></div>
+        <div class="item"><span class="pos">3º</span><span class="pct">{fmt_pct(p3)}</span></div>
+      </div>
+    </div>
+    """
+
 # =============================== ABAS (INÍCIO) ================================
 @register_tab("Painel")
 def tab1_painel(df_raw: pd.DataFrame):
@@ -502,9 +525,6 @@ def tab1_painel(df_raw: pd.DataFrame):
         f"3º: {cov[3]/total_pesq*100:.1f}%</div>",
         unsafe_allow_html=True
     )
-
-    st.markdown(CARD_CSS, unsafe_allow_html=True)
-    st.markdown("<hr style='margin:6px 0'>", unsafe_allow_html=True)
 
     W = winners_by_position(df)
     Wg = W.replace({
@@ -544,7 +564,6 @@ def tab1_painel(df_raw: pd.DataFrame):
     st.markdown("<hr style='margin:14px 0 8px 0'>", unsafe_allow_html=True)
     st.subheader("Painel por Cia")
     st.caption("Cada coluna mostra o ranking das agências para a CIA correspondente (cards um abaixo do outro).")
-    st.markdown(CARDS_STACK_CSS, unsafe_allow_html=True)
 
     if "CIA_NORM" not in df.columns:
         st.info("Coluna 'CIA_NORM' não encontrada nos dados filtrados."); return
