@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import os, re, time, math
+import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -10,12 +11,11 @@ import altair as alt
 
 # ========================== CONFIGURAÇÃO BASE DO APP ==========================
 st.set_page_config(
-    page_title="PD27 — Leitor de saídas (data/)",
+    page_title="PD27 — Leitor de saídas (GitHub: data/)",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Paleta simples (opcional no CSS)
 st.markdown("""
 <style>
 .block-container { padding-top: 0.6rem; }
@@ -23,37 +23,140 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================= RESOLUÇÃO DE CAMINHOS ==========================
 APP_DIR = Path(__file__).resolve().parent
 CWD     = Path.cwd()
 
-# Candidatos para localizar a pasta data/ (suporta vários layouts)
-CANDIDATES = [
-    Path(os.environ.get("DATA_DIR")) if os.environ.get("DATA_DIR") else None,  # ENV sobrescreve
-    APP_DIR / "data",         # scripts/data
-    APP_DIR.parent / "data",  # raiz/data  ← mais comum
-    CWD / "data",             # execução a partir da raiz
-]
-CANDIDATES = [p for p in CANDIDATES if p is not None]
+# ========================== SYNC DO GITHUB -> .cache_data/data ===============
+ALLOWED_EXTS = (".parquet", ".csv", ".pdf")
 
-def pick_data_dir(cands: List[Path]) -> Path:
-    for p in cands:
-        if p.exists() and p.is_dir():
-            return p
-    # fallback: cria em raiz/data
-    fallback = APP_DIR.parent / "data"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+def _secrets_or_env(key: str, default: Optional[str]=None) -> Optional[str]:
+    # Busca primeiro em st.secrets (Streamlit Cloud) e depois em variáveis de ambiente
+    if key in st.secrets: return st.secrets[key]
+    return os.environ.get(key, default)
 
-DEFAULT_DATA_DIR = pick_data_dir(CANDIDATES)
+def _gh_headers(token: Optional[str]) -> Dict[str, str]:
+    hdrs = {"Accept": "application/vnd.github+json"}
+    if token:
+        hdrs["Authorization"] = f"token {token}"
+    return hdrs
+
+def _gh_headers_raw(token: Optional[str]) -> Dict[str, str]:
+    # Para baixar conteúdo raw pelo endpoint /contents
+    hdrs = {"Accept": "application/vnd.github.raw"}
+    if token:
+        hdrs["Authorization"] = f"token {token}"
+    return hdrs
+
+def _split_repo(repo: str) -> Tuple[str, str]:
+    # "owner/name" -> ("owner","name")
+    parts = repo.strip().split("/")
+    if len(parts) != 2:
+        raise ValueError("GH_REPO deve ser no formato 'owner/repo'.")
+    return parts[0], parts[1]
+
+def gh_sync_folder(repo: str, branch: str = "main", folder: str = "data",
+                   token: Optional[str] = None) -> Path:
+    """
+    Lista todos os arquivos do repositório (via Git Trees API) e baixa apenas
+    os que estão dentro de `folder` e terminam com ALLOWED_EXTS.
+    Salva em .cache_data/<folder>/... (replicando subpastas).
+    Retorna o caminho local da pasta sincronizada.
+    """
+    owner, name = _split_repo(repo)
+    # 1) Lista todos os paths do branch (recursivo)
+    tree_url = f"https://api.github.com/repos/{owner}/{name}/git/trees/{branch}?recursive=1"
+    r = requests.get(tree_url, headers=_gh_headers(token), timeout=60)
+    if r.status_code == 404:
+        raise RuntimeError("Repositório/branch não encontrado. Confirme GH_REPO e GH_BRANCH.")
+    r.raise_for_status()
+    data = r.json()
+    tree = data.get("tree", [])
+    if not tree:
+        raise RuntimeError("Árvore do repositório vazia ou inacessível.")
+
+    # 2) Filtra os arquivos dentro de `folder`
+    folder = folder.strip("/").strip()
+    want_prefix = folder + "/"
+    selected = []
+    for node in tree:
+        path = node.get("path", "")
+        ntype = node.get("type")
+        if ntype == "blob" and path.startswith(want_prefix) and path.lower().endswith(ALLOWED_EXTS):
+            size = node.get("size")  # pode estar ausente
+            selected.append((path, size))
+
+    if not selected:
+        raise RuntimeError(f"Nenhum arquivo suportado encontrado dentro de '{folder}/'.")
+
+    # 3) Baixa cada arquivo via /contents (suporta repo privado)
+    cache_root = Path(".cache_data")
+    local_root = cache_root / folder
+    local_root.mkdir(parents=True, exist_ok=True)
+
+    with st.spinner(f"Sincronizando {len(selected)} arquivos de '{repo}/{folder}'..."):
+        for rel_path, size in selected:
+            dest_file = cache_root / rel_path  # preserva subpastas
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Se já existe e o tamanho bate (quando disponível), pula
+            if dest_file.exists() and isinstance(size, int) and dest_file.stat().st_size == size:
+                continue
+
+            cont_url = f"https://api.github.com/repos/{owner}/{name}/contents/{rel_path}?ref={branch}"
+            rr = requests.get(cont_url, headers=_gh_headers_raw(token), timeout=120)
+            if rr.status_code == 404:
+                # arquivo sumiu? pula
+                continue
+            rr.raise_for_status()
+            dest_file.write_bytes(rr.content)
+
+    return local_root
+
+# ============================= RESOLUÇÃO DE CAMINHOS ==========================
+# Preferência: se GH_REPO/GH_PATH dados -> usar sync do GitHub. Caso contrário, cair no local.
+USE_GH = ("GH_REPO" in st.secrets) or ("GH_REPO" in os.environ)
+
+DEFAULT_DATA_DIR: Path
+if USE_GH:
+    GH_REPO   = _secrets_or_env("GH_REPO")
+    GH_TOKEN  = _secrets_or_env("GH_TOKEN")      # opcional (necessário p/ privado)
+    GH_BRANCH = _secrets_or_env("GH_BRANCH", "main")
+    GH_PATH   = _secrets_or_env("GH_PATH", "data")
+    try:
+        DEFAULT_DATA_DIR = gh_sync_folder(GH_REPO, branch=GH_BRANCH, folder=GH_PATH, token=GH_TOKEN)
+        # força o app a trabalhar a partir do cache baixado
+        os.environ["DATA_DIR"] = str(DEFAULT_DATA_DIR.resolve())
+        st.success(f"Dados sincronizados de **{GH_REPO}/{GH_PATH}** ({GH_BRANCH}).")
+    except Exception as e:
+        st.error(f"Falha ao sincronizar do GitHub: {e}")
+        # fallback para local
+        DEFAULT_DATA_DIR = (APP_DIR.parent / "data")
+        DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    # Sem GH_REPO definido: mantém comportamento local
+    CANDIDATES = [
+        Path(os.environ.get("DATA_DIR")) if os.environ.get("DATA_DIR") else None,  # ENV sobrescreve
+        APP_DIR / "data",         # scripts/data
+        APP_DIR.parent / "data",  # raiz/data  ← mais comum
+        CWD / "data",             # execução a partir da raiz
+    ]
+    CANDIDATES = [p for p in CANDIDATES if p is not None]
+    def pick_data_dir(cands: List[Path]) -> Path:
+        for p in cands:
+            if p.exists() and p.is_dir():
+                return p
+        fallback = APP_DIR.parent / "data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    DEFAULT_DATA_DIR = pick_data_dir(CANDIDATES)
 
 # =============================== UI — SIDEBAR ================================
 st.sidebar.header("📁 Fonte de dados (PD27)")
 data_dir_input = st.sidebar.text_input(
     "Caminho da pasta de dados",
-    value=str(DEFAULT_DATA_DIR.resolve()),
-    help="Aponte para a pasta onde o PD27 salva as saídas (ex.: .../data). "
-         "Por padrão, detectamos raiz/data mesmo com o app dentro de scripts/."
+    value=str(Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()),
+    help=("Se GH_REPO/GH_PATH estiverem definidos, este caminho já aponta para o cache sincronizado (.cache_data/...). "
+          "Você ainda pode mudar manualmente se quiser ler outra pasta local.")
 )
 DATA_DIR = Path(data_dir_input).expanduser()
 
@@ -76,7 +179,17 @@ prefix_filter = st.sidebar.text_input(
     help="Deixe vazio para pegar todos. Use para filtrar por prefixo (case-insensitive)."
 )
 
-st.sidebar.caption("Dica: defina DATA_DIR como variável de ambiente para fixar o caminho.")
+# Botão para re-sincronizar do GitHub
+if USE_GH and st.sidebar.button("🔄 Re-sincronizar do GitHub"):
+    try:
+        refreshed = gh_sync_folder(GH_REPO, branch=GH_BRANCH, folder=GH_PATH, token=GH_TOKEN)
+        os.environ["DATA_DIR"] = str(refreshed.resolve())
+        st.sidebar.success("Re-sincronizado com sucesso.")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Falha ao re-sincronizar: {e}")
+
+st.sidebar.caption("Dica: GH_REPO/GH_PATH em Secrets fazem o app puxar a pasta data direto do GitHub.")
 
 # ================================ UTILIDADES =================================
 def list_files(dirpath: Path, types: List[str], prefix: str = "") -> Dict[str, list]:
@@ -87,13 +200,13 @@ def list_files(dirpath: Path, types: List[str], prefix: str = "") -> Dict[str, l
         "pdf":     [".pdf"],
     }
     found: Dict[str, list] = {k: [] for k in exts.keys()}
-    for p in dirpath.glob("*"):
+    for p in dirpath.rglob("*"):  # suporta subpastas dentro de data
         if not p.is_file():
             continue
         ext = p.suffix.lower()
         name_ok = True
         if prefix_norm:
-            name_ok = p.name.lower().startswith(prefix_norm)
+            name_ok = Path(p.name).name.lower().startswith(prefix_norm)
         if not name_ok:
             continue
         for t in types:
@@ -137,8 +250,7 @@ def load_tabular(files_parquet: list[Path], files_csv: list[Path]) -> pd.DataFra
 
     # Conversões leves: tenta números/datas nas colunas textuais
     for col in df_all.columns:
-        if col == "__source_file__":
-            continue
+        if col == "__source_file__": continue
         if df_all[col].dtype == "object":
             # tenta numérico
             df_num = pd.to_numeric(df_all[col].astype(str).str.replace(",",".", regex=False), errors="ignore")
@@ -148,7 +260,6 @@ def load_tabular(files_parquet: list[Path], files_csv: list[Path]) -> pd.DataFra
             # tenta datetime
             try:
                 df_dt = pd.to_datetime(df_all[col], errors="raise", utc=False, dayfirst=False, infer_datetime_format=True)
-                # só aceita se tiver variação (evitar converter códigos aleatórios)
                 if df_dt.notna().sum() >= max(3, int(len(df_dt)*0.1)):
                     df_all[col] = df_dt
             except Exception:
@@ -157,7 +268,6 @@ def load_tabular(files_parquet: list[Path], files_csv: list[Path]) -> pd.DataFra
 
 # ============================== COLETA DE ARQUIVOS ============================
 files_dict = list_files(DATA_DIR, file_types, prefix_filter)
-
 parquet_files = files_dict.get("parquet", [])
 csv_files     = files_dict.get("csv", [])
 pdf_files     = files_dict.get("pdf", [])
@@ -170,7 +280,7 @@ _ = _mtimes(parquet_files + csv_files)
 df = load_tabular(parquet_files, csv_files)
 
 # =============================== VISÃO PRINCIPAL ==============================
-st.title("PD27 — Leitura de saídas da pasta data/")
+st.title("PD27 — Leitura de saídas (GitHub → cache/data)")
 
 colA, colB, colC = st.columns(3)
 with colA:
@@ -187,10 +297,8 @@ with tabs[0]:
     if df.empty:
         st.info("Nenhum .parquet / .csv carregado com o filtro atual. Ajuste o prefixo ou tipos na lateral.")
     else:
-        # Colunas & filtros básicos
         st.subheader("Prévia dos dados")
         st.caption("Incluímos a coluna `__source_file__` para rastrear a origem de cada linha.")
-        # Seleção de colunas para exibir
         cols = list(df.columns)
         show_cols = st.multiselect(
             "Colunas a exibir",
@@ -199,7 +307,6 @@ with tabs[0]:
         )
         st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
 
-        # Download opcional do combinado
         @st.cache_data(show_spinner=False)
         def to_parquet_bytes(df_in: pd.DataFrame) -> bytes:
             import io
@@ -214,10 +321,9 @@ with tabs[0]:
             mime="application/octet-stream",
         )
 
-        # Info rápida sobre arquivos lidos
         with st.expander("Arquivos lidos (tabulares)"):
             st.write(pd.DataFrame({
-                "arquivo": [p.name for p in parquet_files + csv_files],
+                "arquivo": [str(p.relative_to(DATA_DIR)) for p in parquet_files + csv_files],
                 "modificado_em": [time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.stat().st_mtime)) for p in parquet_files + csv_files],
                 "tamanho_KB": [round(p.stat().st_size/1024, 1) for p in parquet_files + csv_files],
             }))
@@ -227,7 +333,6 @@ with tabs[1]:
     if df.empty:
         st.info("Sem dados tabulares para plotar.")
     else:
-        # Heurísticas: escolhe 1 categórica e 1 numérica automaticamente
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != "__source_file__"]
         cat_cols = [c for c in df.columns if (df[c].dtype == "object" or pd.api.types.is_categorical_dtype(df[c])) and c != "__source_file__"]
 
@@ -238,7 +343,6 @@ with tabs[1]:
             cnt = df[cat].value_counts(dropna=False).reset_index()
             cnt.columns = [cat, "contagem"]
             cnt = cnt.head(topn)
-
             chart = alt.Chart(cnt).mark_bar().encode(
                 x=alt.X("contagem:Q", title="Contagem"),
                 y=alt.Y(f"{cat}:N", sort='-x', title=cat),
@@ -270,7 +374,7 @@ with tabs[2]:
     else:
         st.subheader("Lista de PDFs (sem leitura de conteúdo)")
         df_pdf = pd.DataFrame({
-            "arquivo": [p.name for p in pdf_files],
+            "arquivo": [str(p.relative_to(DATA_DIR)) for p in pdf_files],
             "modificado_em": [time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.stat().st_mtime)) for p in pdf_files],
             "tamanho_KB": [round(p.stat().st_size/1024, 1) for p in pdf_files],
         })
