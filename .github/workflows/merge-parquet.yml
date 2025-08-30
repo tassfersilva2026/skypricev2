@@ -1,4 +1,4 @@
-name: Merge Parquet (data/ → ALL_MERGED.parquet)
+name: Merge Parquet (PR mode)
 
 on:
   workflow_dispatch:
@@ -7,33 +7,28 @@ on:
       - "data/**/*.parquet"
       - "scripts/merge_parquet.py"
   schedule:
-    # 03:05 America/Sao_Paulo ≈ 06:05 UTC
     - cron: "5 6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   merge:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # precisamos do histórico p/ commit
+          fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Instalar dependências
+      - name: Instalar deps
         run: |
           python -m pip install --upgrade pip
-          # usa requirements.txt se existir, senão instala o mínimo
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas pyarrow
-          fi
+          pip install pandas pyarrow
 
       - name: Rodar merge
         run: |
@@ -42,25 +37,13 @@ jobs:
             --pattern "*.parquet" \
             --out data/ALL_MERGED.parquet
 
-      - name: Subir artefato (opcional)
-        uses: actions/upload-artifact@v4
+      - name: Criar PR com a atualização
+        uses: peter-evans/create-pull-request@v6
         with:
-          name: ALL_MERGED.parquet
-          path: data/ALL_MERGED.parquet
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Commit & push se houver mudanças
-        env:
-          GIT_AUTHOR_NAME: github-actions
-          GIT_AUTHOR_EMAIL: actions@users.noreply.github.com
-          GIT_COMMITTER_NAME: github-actions
-          GIT_COMMITTER_EMAIL: actions@users.noreply.github.com
-        run: |
-          git add data/ALL_MERGED.parquet
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: atualizar data/ALL_MERGED.parquet [Actions]"
-            git push
-          else
-            echo "Sem mudanças para commitar."
-          fi
+          commit-message: "chore: atualizar data/ALL_MERGED.parquet [Actions]"
+          title: "Atualizar ALL_MERGED.parquet"
+          body: "Atualização automática do arquivo mestrado."
+          branch: bot/update-merged-parquet
+          delete-branch: true
+          add-paths: |
+            data/ALL_MERGED.parquet
