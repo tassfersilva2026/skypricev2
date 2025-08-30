@@ -1,4 +1,4 @@
-name: Merge Parquet (PR mode)
+name: Merge Parquet (data/ → ALL_MERGED.parquet)
 
 on:
   workflow_dispatch:
@@ -7,11 +7,10 @@ on:
       - "data/**/*.parquet"
       - "scripts/merge_parquet.py"
   schedule:
-    - cron: "5 6 * * *"
+    - cron: "5 6 * * *" # 03:05 BRT ~ 06:05 UTC
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write   # <-- ESSENCIAL
 
 jobs:
   merge:
@@ -20,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}   # garante o token certo
 
       - uses: actions/setup-python@v5
         with:
@@ -37,13 +37,17 @@ jobs:
             --pattern "*.parquet" \
             --out data/ALL_MERGED.parquet
 
-      - name: Criar PR com a atualização
-        uses: peter-evans/create-pull-request@v6
-        with:
-          commit-message: "chore: atualizar data/ALL_MERGED.parquet [Actions]"
-          title: "Atualizar ALL_MERGED.parquet"
-          body: "Atualização automática do arquivo mestrado."
-          branch: bot/update-merged-parquet
-          delete-branch: true
-          add-paths: |
-            data/ALL_MERGED.parquet
+      - name: Commit & push se houver mudanças
+        env:
+          GIT_AUTHOR_NAME: github-actions
+          GIT_AUTHOR_EMAIL: actions@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions
+          GIT_COMMITTER_EMAIL: actions@users.noreply.github.com
+        run: |
+          git add data/ALL_MERGED.parquet
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: atualizar data/ALL_MERGED.parquet [Actions]"
+            git push
+          else
+            echo "Sem mudanças para commitar."
+          fi
