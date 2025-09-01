@@ -33,26 +33,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install tzdata
 
       - name: Ensure folders
         run: |
-          mkdir -p inbox data out state
+          mkdir -p inbox data out state scripts
 
       - name: Compute run timestamp (America/Sao_Paulo)
         run: echo "RUN_TS=$(TZ=America/Sao_Paulo date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
 
-      # ====== GRAVAÇÃO SEGURA DO sa.json (sem echo) ======
+      # ====== GRAVAÇÃO SEGURA DO sa.json ======
       - name: Write Service Account JSON (safe heredoc)
         run: |
           cat > sa.json <<'JSON'
           ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           JSON
 
-      # Valida o JSON sem imprimir o conteúdo
       - name: Validate sa.json
         run: |
           python - << 'PY'
-          import json,sys
+          import json
           json.load(open('sa.json'))
           print("Service Account JSON OK")
           PY
@@ -66,7 +66,6 @@ jobs:
             echo "ERRO: Secret DRIVE_FOLDER_ID ausente (repo Settings > Secrets and variables > Actions)."
             exit 1
           fi
-          # passa o ID como argumento para evitar depender de env
           python scripts/drive_pull.py "${{ secrets.DRIVE_FOLDER_ID }}"
 
       - name: Extrair e gerar Parquet+XLS por rodada (sem repetir)
@@ -87,12 +86,17 @@ jobs:
           if-no-files-found: error
 
       - name: Commit & Push (somente data/ + state/)
+        env:
+          GIT_AUTHOR_NAME: github-actions
+          GIT_AUTHOR_EMAIL: actions@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions
+          GIT_COMMITTER_EMAIL: actions@users.noreply.github.com
         run: |
           set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add data/*.parquet state/*.json || true
+          git config user.name  "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          git add -A data state || true
+          if ! git diff --cached --quiet; then
             git commit -m "chore(parquet): OFERTAS @ ${GITHUB_RUN_NUMBER}"
             git push
             echo "Changes pushed."
