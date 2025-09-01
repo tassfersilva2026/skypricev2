@@ -34,7 +34,6 @@ def main():
     dfs = []
     all_cols = set()
 
-    # 1) Leitura e coleta do conjunto total de colunas (tolerante a schemas diferentes)
     for f in files:
         try:
             df = pd.read_parquet(f, engine="pyarrow")
@@ -49,27 +48,21 @@ def main():
         return
 
     all_cols = list(all_cols)
-
-    # 2) Realinha colunas (preenche ausentes com NaN)
     print(f"[merge] Unificando schema para {len(all_cols)} coluna(s).")
     dfs = [d.reindex(columns=all_cols) for d in dfs]
 
-    # 3) Concatena
     print("[merge] Concatenando...")
     big = pd.concat(dfs, ignore_index=True)
 
-    # 4) Dedup opcional
     if args.dedupe_on:
         antes = len(big)
         big = big.drop_duplicates(subset=args.dedupe_on, keep="last", ignore_index=True)
         print(f"[merge] drop_duplicates({args.dedupe_on}) → {antes:,} → {len(big):,}")
 
-    # 5) Ordenação opcional
     if args.sort_by:
         big = big.sort_values(by=args.sort_by, kind="stable", ignore_index=True)
         print(f"[merge] Ordenado por: {args.sort_by}")
 
-    # 6) Garante pasta e salva
     out_path.parent.mkdir(parents=True, exist_ok=True)
     big.to_parquet(out_path, engine="pyarrow", index=False)
     print(f"[merge] Salvo em: {out_path}  ({len(big):,} linhas)")
