@@ -114,4 +114,133 @@ jobs:
               req = drive.files().get_media(fileId=fid)
               buf = io.BytesIO()
               dl = MediaIoBaseDownload(buf, req)
-              done = Fals
+              done = False
+              while not done:
+                  _, done = dl.next_chunk()
+              return buf.getvalue(), name
+
+          def upload_bytes_to_slack(content: bytes, filename: str, title: str, thread_ts: str | None = None):
+              slack.files_upload_v2(
+                  channel=SLACK_CHANNEL,
+                  filename=filename.replace(":", "-"),
+                  file=io.BytesIO(content),
+                  title=title,
+                  thread_ts=thread_ts,
+              )
+              print(f"[ok] Enviado: {filename} ({len(content)} bytes)")
+
+          def base_from_vm_mb(name_no_ext: str):
+              m = re.search(r'[\s_\-]*(VM|MB)\s*$', name_no_ext.strip(), flags=re.I)
+              if m:
+                  suf = m.group(1).upper()
+                  base = name_no_ext[:m.start()].rstrip(" _-")
+                  return base, suf
+              return name_no_ext, None
+
+          def combine_png_pair_to_pdf(vm_bytes: bytes, mb_bytes: bytes) -> bytes:
+              def as_rgb(b): return Image.open(io.BytesIO(b)).convert("RGB")
+              im1, im2 = as_rgb(vm_bytes), as_rgb(mb_bytes)
+              out = io.BytesIO()
+              im1.save(out, format="PDF", save_all=True, append_images=[im2])
+              return out.getvalue()
+
+          def main():
+              cut_utc = to_utc_from_sp(CUTOVER_SP, TZ_NAME) if CUTOVER_SP else None
+              state = load_state()
+
+              pdf_files = list_files(os.environ["PDF_FOLDER_ID"], cut_utc, mime_filter="application/pdf")
+              pdf_sent = set(state.get("pdf_sent_ids", []))
+              pdf_new = [f for f in pdf_files if f["id"] not in pdf_sent]
+
+              thread_ts_pdf = None
+              if pdf_new:
+                  try:
+                      msg = slack.chat_postMessage(channel=SLACK_CHANNEL,
+                                                   text=f"📎 PDFs novos: {len(pdf_new)} (corte: {CUTOVER_SP or 'N/A'})")
+                      thread_ts_pdf = msg["ts"]
+                  except SlackApiError as e:
+                      print(f"[warn] chat_postMessage PDFs: {e.response.get('error')}", file=sys.stderr)
+
+                  for f in pdf_new:
+                      try:
+                          data, fname = fetch_bytes(f)
+                          upload_bytes_to_slack(data, fname, title=fname, thread_ts=thread_ts_pdf)
+                          pdf_sent.add(f["id"])
+                      except Exception as e:
+                          print(f"[warn] PDF {f.get('name')}: {e}", file=sys.stderr)
+
+              state["pdf_sent_ids"] = sorted(pdf_sent)
+
+              png_files = list_files(os.environ["PNG_FOLDER_ID"], cut_utc, mime_filter="image/png")
+              by_base: Dict[str, Dict[str, Dict[str, Any]]] = {}
+              for f in png_files:
+                  base_no_ext = re.sub(r'\.png$', '', f.get("name", ""), flags=re.I)
+                  base, suf = base_from_vm_mb(base_no_ext)
+                  if suf not in ("VM","MB"): continue
+                  by_base.setdefault(base, {}); by_base[base][suf] = f
+
+              pairs = [(base, d["VM"], d["MB"]) for base, d in by_base.items() if "VM" in d and "MB" in d]
+              pair_keys_done = set(state.get("png_pair_keys", []))
+              new_pairs = []
+              for base, f_vm, f_mb in pairs:
+                  key = f"{f_vm['id']}+{f_mb['id']}"
+                  if key not in pair_keys_done: new_pairs.append((base, f_vm, f_mb, key))
+
+              thread_ts_png = None
+              if new_pairs:
+                  try:
+                      msg2 = slack.chat_postMessage(channel=SLACK_CHANNEL,
+                                                    text=f"🖼️ Pares PNG novos: {len(new_pairs)} (VM→MB em PDF)")
+                      thread_ts_png = msg2["ts"]
+                  except SlackApiError as e:
+                      print(f"[warn] chat_postMessage PNGs: {e.response.get('error')}", file=sys.stderr)
+
+                  for base, f_vm, f_mb, key in new_pairs:
+                      try:
+                          b_vm, _ = fetch_bytes(f_vm)
+                          b_mb, _ = fetch_bytes(f_mb)
+                          pdf_bytes = combine_png_pair_to_pdf(b_vm, b_mb)
+                          out_name = f"{base}.pdf"
+                          upload_bytes_to_slack(pdf_bytes, out_name, title=out_name, thread_ts=thread_ts_png)
+                          pair_keys_done.add(key)
+                      except Exception as e:
+                          print(f"[warn] Par '{base}': {e}", file=sys.stderr)
+
+              state["png_pair_keys"] = sorted(pair_keys_done)
+              save_state(state)
+              print("✅ Concluído.")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Write Service Account JSON (safe heredoc)
+        shell: bash
+        run: |
+          cat > sa.json <<'JSON'
+          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          JSON
+
+      - name: Validate sa.json
+        run: |
+          python - <<'PY'
+          import json
+          json.load(open('sa.json'))
+          print("Service Account JSON OK")
+          PY
+
+      - name: Send Drive PDFs + PNG pairs (VM+MB→PDF) to Slack
+        env:
+          SLACK_TOKEN:   ${{ secrets.SLACK_TOKEN }}      # xoxb-...
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}    # C0123ABCD
+          PNG_FOLDER_ID: ${{ secrets.PNG_FOLDER_ID }}    # defina como secret
+          PDF_FOLDER_ID: ${{ secrets.PDF_FOLDER_ID }}    # defina como secret
+          CUTOVER_SP: "2025-08-26T14:00:00"
+          TZ_NAME: "America/Sao_Paulo"
+          MAX_UPLOAD_MB: "100"
+        run: |
+          python scripts/slack_send_drive_pairs.py
+
+      - name: Cleanup secrets file
+        if: always()
+        run: rm -f sa.json || true
