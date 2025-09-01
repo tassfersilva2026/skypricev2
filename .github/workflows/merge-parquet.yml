@@ -10,7 +10,7 @@ on:
     - cron: "5 6 * * *" # 03:05 BRT ~ 06:05 UTC
 
 permissions:
-  contents: write   # <-- ESSENCIAL
+  contents: write
 
 jobs:
   merge:
@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}   # garante o token certo
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -38,15 +38,11 @@ jobs:
             --out data/ALL_MERGED.parquet
 
       - name: Commit & push se houver mudanças
-        env:
-          GIT_AUTHOR_NAME: github-actions
-          GIT_AUTHOR_EMAIL: actions@users.noreply.github.com
-          GIT_COMMITTER_NAME: github-actions
-          GIT_COMMITTER_EMAIL: actions@users.noreply.github.com
         run: |
           git add data/ALL_MERGED.parquet
           if ! git diff --cached --quiet; then
-            git commit -m "chore: atualizar data/ALL_MERGED.parquet [Actions]"
+            git -c user.name="github-actions" -c user.email="actions@users.noreply.github.com" \
+              commit -m "chore: atualizar data/ALL_MERGED.parquet [Actions]"
             git push
           else
             echo "Sem mudanças para commitar."
